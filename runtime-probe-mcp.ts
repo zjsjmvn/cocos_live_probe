@@ -52,7 +52,7 @@ export const RUNTIME_PROBE_MCP_TOOLS: readonly RuntimeProbeMcpTool[] = [
     },
     {
         name: "runtime_launch",
-        description: "Launch or attach the localhost-only dedicated Chrome for the ZhuanDao preview.",
+        description: "Launch or attach the localhost-only dedicated Chrome for the active Cocos preview.",
         inputSchema: emptySchema(),
     },
     {

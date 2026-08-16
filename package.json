@@ -1,0 +1,18 @@
+{
+  "name": "cocos-live-probe",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Local CLI and MCP diagnostics for a running Cocos Creator browser preview.",
+  "scripts": {
+    "runtime:probe": "ts-node -P tsconfig.json runtime-probe.ts",
+    "runtime:probe:mcp": "ts-node -P tsconfig.json runtime-probe-mcp.ts --stdio",
+    "runtime:probe:mcp:http": "ts-node -P tsconfig.json runtime-probe-mcp.ts --http",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "ts-node -P tsconfig.json test/runtime-probe.test.ts"
+  },
+  "devDependencies": {
+    "@types/node": "^22.15.29",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.9.2"
+  }
+}

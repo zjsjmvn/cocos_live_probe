@@ -126,6 +126,7 @@ export interface RuntimeProbeDependencies {
 }
 
 export interface RuntimeProbeServiceOptions {
+    readonly workspaceRoot?: string;
     readonly previewUrl?: string;
     readonly cdpOrigin?: string;
     readonly chromeProfileDirectory?: string;
@@ -229,9 +230,42 @@ export function buildManagedPreviewUrl(previewUrl: string, instanceId: string): 
     return url.toString();
 }
 
-function defaultSharedTargetLockPath(managedPreviewUrl: string): string {
-    const identity = createHash("sha256").update(managedPreviewUrl).digest("hex").slice(0, 24);
-    return path.join(os.tmpdir(), `zhuandao-runtime-probe-shared-target-${identity}.lock`);
+export interface RuntimeProbeWorkspaceDefaults {
+    readonly identity: string;
+    readonly chromeProfileDirectory: string;
+    readonly chromeLaunchLockPath: string;
+}
+
+export function createRuntimeProbeWorkspaceDefaults(
+    workspaceRoot: string = path.resolve(__dirname, "..", ".."),
+): RuntimeProbeWorkspaceDefaults {
+    const normalizedRoot = path.resolve(workspaceRoot).replace(/\\/g, "/").toLowerCase();
+    const identity = createHash("sha256").update(normalizedRoot).digest("hex").slice(0, 16);
+    return {
+        identity,
+        chromeProfileDirectory: path.join(
+            os.tmpdir(),
+            `cocos-live-probe-${identity}-chrome`,
+        ),
+        chromeLaunchLockPath: path.join(
+            os.tmpdir(),
+            `cocos-live-probe-${identity}-chrome-launch.lock`,
+        ),
+    };
+}
+
+function defaultSharedTargetLockPath(
+    managedPreviewUrl: string,
+    workspaceIdentity: string,
+): string {
+    const targetIdentity = createHash("sha256")
+        .update(managedPreviewUrl)
+        .digest("hex")
+        .slice(0, 24);
+    return path.join(
+        os.tmpdir(),
+        `cocos-live-probe-${workspaceIdentity}-shared-target-${targetIdentity}.lock`,
+    );
 }
 
 export class RuntimeProbeService {
@@ -260,10 +294,11 @@ export class RuntimeProbeService {
     private disposePromise: Promise<void> | undefined;
 
     public constructor(options: RuntimeProbeServiceOptions = {}) {
+        const workspaceDefaults = createRuntimeProbeWorkspaceDefaults(options.workspaceRoot);
         this.previewUrl = options.previewUrl ?? DEFAULT_PREVIEW_URL;
         this.cdpOrigin = options.cdpOrigin ?? DEFAULT_CDP_ORIGIN;
         this.chromeProfileDirectory = options.chromeProfileDirectory
-            ?? path.join(os.tmpdir(), "zhuandao-runtime-probe-chrome");
+            ?? workspaceDefaults.chromeProfileDirectory;
         this.chromeCandidates = options.chromeCandidates ?? defaultChromeCandidates();
         this.launchTimeoutMs = options.launchTimeoutMs ?? 10_000;
         this.readyTimeoutMs = options.readyTimeoutMs ?? 10_000;
@@ -276,9 +311,12 @@ export class RuntimeProbeService {
         const defaultDependencyOptions: DefaultDependencyOptions = {
             cdpOrigin: this.cdpOrigin,
             lockPath: options.chromeLaunchLockPath
-                ?? path.join(os.tmpdir(), "zhuandao-runtime-probe-chrome-launch.lock"),
+                ?? workspaceDefaults.chromeLaunchLockPath,
             sharedTargetLockPath: options.sharedTargetLockPath
-                ?? defaultSharedTargetLockPath(this.managedPreviewUrl),
+                ?? defaultSharedTargetLockPath(
+                    this.managedPreviewUrl,
+                    workspaceDefaults.identity,
+                ),
             lockTimeoutMs: this.launchTimeoutMs,
             pollIntervalMs: this.pollIntervalMs,
         };

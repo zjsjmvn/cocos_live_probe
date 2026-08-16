@@ -19,23 +19,30 @@ CLI manual-cli / HTTP MCP 单实例 ---------> 各自的受管页面
 
 各页面仍从同一个 `127.0.0.1:7456` 读取资源。BrowserContext 隔离运行时内存、Storage 和页面生命周期，但不提供资源版本快照；刷新后的页面会读取当前资源，未刷新的页面若随后懒加载资源，也可能读取到资源服务上的新版本。
 
-ZhuanDao 中两个 MCP 的职责不同：
+在接入了 Cocos Creator 编辑器 MCP 的宿主项目中，两个 MCP 的职责不同：
 
 - `cocos_creator`：编辑器场景、资源数据库、编辑器控制台和资源刷新。
 - `cocos_live_probe`：运行中浏览器预览的节点、动画、骨骼、蒙皮和 bounds。
 
 ## 前置条件
 
-- Cocos Creator 3.8.8 已打开 ZhuanDao 项目。
-- 当前场景为 `db://assets/game/bundles/zhuandao/scenes/battle.scene`，并已启动浏览器预览。
+- Cocos Creator 已打开宿主项目，并已启动目标场景的浏览器预览。
 - 预览地址可通过 `http://127.0.0.1:7456/` 访问。
-- 已安装项目依赖，Node.js 和 `npm` 可在项目根目录运行。
+- 已安装 Node.js，并在本工具目录执行过 `npm install`。
 - Windows 上已安装 Google Chrome；工具会从常见的用户或 Program Files 路径查找 `chrome.exe`。
 - 本地端口 `9222` 用于 CDP；启用 HTTP MCP 时还需要端口 `3001`。
 
 ## 快速开始
 
-在项目根目录 `F:\dev\cocos\mydev\ZhuanDao` 运行：
+在宿主项目根目录添加并安装工具：
+
+```powershell
+git submodule add https://github.com/zjsjmvn/cocos_live_probe.git tools/cocos_live_probe
+cd tools/cocos_live_probe
+npm install
+```
+
+后续命令都从 `tools/cocos_live_probe` 目录运行：
 
 ```powershell
 # 1. 只检查状态，不启动 Chrome
@@ -124,10 +131,14 @@ npm run runtime:probe -- sample-animation "<active-enemy-node-uuid>" --duration 
 [mcp_servers.cocos_live_probe]
 command = "npm"
 args = ["run", "--silent", "runtime:probe:mcp"]
-cwd = "F:\\dev\\cocos\\mydev\\ZhuanDao"
+cwd = "<absolute-project-path>\\tools\\cocos_live_probe"
 startup_timeout_sec = 20
 tool_timeout_sec = 45
 ```
+
+工具按自身目录向上两级解析宿主项目根目录，并以该绝对路径生成稳定的
+workspace identity。不同宿主项目因此使用不同的 Chrome profile 和锁文件；
+无需在宿主项目中增加额外配置。
 
 Codex 通常在会话启动时加载项目 MCP 配置。修改 `.codex/config.toml` 后，当前会话不保证热加载 `cocos_live_probe`；重新打开项目会话后再检查工具列表。当前会话未加载时，可先用 CLI 完成同样的结构化读取。
 
@@ -206,7 +217,7 @@ HTTP MCP 服务只有一个长期 `RuntimeProbeService`。所有 HTTP 客户端�
 ## 安全边界
 
 - 预览 URL、CDP、HTTP MCP 都固定在 `127.0.0.1`，不要改成局域网或公网监听。
-- Chrome 使用 `%TEMP%\zhuandao-runtime-probe-chrome` 独立 profile，不复用日常浏览器 profile。
+- Chrome 使用按宿主项目绝对路径生成的 `%TEMP%\cocos-live-probe-<workspace-id>-chrome` 独立 profile，不复用日常浏览器 profile，也不与其他项目共享探针状态。
 - stdio 对话只操作自己创建并严格校验的 BrowserContext/target；同源存在多个受管页面是正常状态，不要手工关闭其他对话的页面。
 - CLI 固定使用 `manual-cli` 共享实例；HTTP MCP 的所有客户端共享该 HTTP 服务实例。不要把这两个入口当作对话级隔离通道。
 - `127.0.0.1:7456` 是所有实例共享的当前资源源，不是版本快照。未刷新的页面保持当前内存状态，但后续懒加载仍可能看到新资源。
@@ -237,7 +248,7 @@ HTTP MCP 服务只有一个长期 `RuntimeProbeService`。所有 HTTP 客户端�
 
 ### 场景树为空或 `game.inited` 尚未完成
 
-等待预览初始化；仍为空或出现 `Cocos preview ready timed out` 时，回到 Creator 检查资源编译和预览控制台。修复后调用当前实例的 `runtime_launch` 或 `runtime_refresh`，不要刷新其他对话。若专用 Chrome 在重复引擎初始化后已异常，只关闭确认属于 `%TEMP%\zhuandao-runtime-probe-chrome` 且占用 `9222` 的进程，再重新 `launch`。
+等待预览初始化；仍为空或出现 `Cocos preview ready timed out` 时，回到 Creator 检查资源编译和预览控制台。修复后调用当前实例的 `runtime_launch` 或 `runtime_refresh`，不要刷新其他对话。若专用 Chrome 在重复引擎初始化后已异常，只关闭确认属于 `%TEMP%\cocos-live-probe-<workspace-id>-chrome` 且占用 `9222` 的进程，再重新 `launch`。
 
 ### `Dedicated Chrome did not expose` 或 CDP 不可用
 
