@@ -92,6 +92,23 @@ async function main() {
         const singleKey = await dispatch("input", { action: "key", keys: ["b"], durationMs: 0, observation: screen.observation });
         assert.strictEqual(singleKey.cleanupConfirmed, true);
         assert.ok((await snapshot()).keys.some((key: any) => key.key === "b" && !key.ctrl));
+        await service.dispatch({ kind: "eval", expression: `(() => {
+            const field = document.createElement("input"); field.id = "probe-keyboard-field";
+            field.style.cssText = "position:fixed;left:0;top:0;width:100px";
+            document.body.appendChild(field); field.focus(); return true;
+        })()` });
+        for (const key of ["a", "1"]) {
+            const shifted = await dispatch("input", { action: "key", keys: ["Shift", key], durationMs: 0, observation: screen.observation });
+            assert.strictEqual(shifted.status, "sent");
+        }
+        await dispatch("input", { action: "key", keys: ["b"], durationMs: 0, observation: screen.observation });
+        const textInput = await service.dispatch({ kind: "eval", expression: `document.getElementById("probe-keyboard-field").value` });
+        assert.strictEqual(textInput, "A!b", "Shift maps DOM key and text, and releases before the next key");
+        const shiftedKeys = (await snapshot()).keys;
+        assert.ok(shiftedKeys.some((key: any) => key.key === "A" && key.shift));
+        assert.ok(shiftedKeys.some((key: any) => key.key === "!" && key.shift));
+        await service.dispatch({ kind: "eval", expression: `document.getElementById("probe-keyboard-field").remove()` });
+        evidence.shiftText = textInput;
         evidence.keyboard = await snapshot();
         const longPress = await dispatch("input", { action: "long-press", device: "mouse", point: { uuid: fixture.uuid }, durationMs: 100, observation: screen.observation });
         assert.strictEqual(longPress.cleanupConfirmed, true);
@@ -143,10 +160,11 @@ async function main() {
         const targets = await (await fetch(`${cdpOrigin}/json/list`)).json() as any[];
         const target = targets.find(target => target.id === screen.targetId);
         const page = new CdpRuntimeProbe(target.webSocketDebuggerUrl);
+        const window = await browser.send<{ windowId: number; bounds: Record<string, unknown> }>("Browser.getWindowForTarget", { targetId: screen.targetId });
         try {
-            const window = await browser.send<{ windowId: number }>("Browser.getWindowForTarget", { targetId: screen.targetId });
             await browser.send("Browser.setWindowBounds", { windowId: window.windowId, bounds: { windowState: "normal" } });
-            await browser.send("Browser.setWindowBounds", { windowId: window.windowId, bounds: { width: 800, height: 800 } });
+            await browser.send("Browser.setWindowBounds", { windowId: window.windowId,
+                bounds: { width: resized.viewport.width + 100, height: resized.viewport.height + 160 } });
             await page.evaluate("new Promise(resolve => setTimeout(() => resolve(true), 100))");
             await assert.rejects(dispatch("input", { action: "click", device: "mouse", point: { uuid: fixture.uuid }, observation: resized.observation }), /stale.*geometry/i);
             const windowScreen = await dispatch("screenshot");
@@ -172,7 +190,12 @@ async function main() {
             await page.reload();
             await assert.rejects(dispatch("input", { action: "click", device: "mouse", point: { x: 10, y: 10 }, observation: sceneScreen.observation }), /stale.*page/i);
             evidence.manualReloadRejectsStale = true;
-        } finally { page.dispose(); browser.dispose(); }
+        } finally {
+            try {
+                await browser.send("Browser.setWindowBounds", { windowId: window.windowId,
+                    bounds: window.bounds.windowState === "normal" ? window.bounds : { windowState: window.bounds.windowState } });
+            } finally { page.dispose(); browser.dispose(); }
+        }
         const beforeRefresh = await dispatch("screenshot");
         await service.dispatch({ kind: "refresh" });
         await assert.rejects(dispatch("input", { action: "click", device: "mouse", point: { x: 10, y: 10 }, observation: beforeRefresh.observation }), /stale.*page/i);

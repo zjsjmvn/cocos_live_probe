@@ -25,7 +25,7 @@ class OperationDeadlineError extends Error {}
 
 function deadlineTransport(page: PageTransport, deadline: number): PageTransport {
     const send = (method: string, params?: Readonly<Record<string, unknown>>, timeoutMs?: number) => {
-        const remaining = Math.floor(deadline - performance.now());
+        const remaining = Math.ceil(deadline - performance.now());
         if (remaining <= 0) throw new OperationDeadlineError("Operation total timeout exceeded");
         return page.send(method, params, Math.min(timeoutMs ?? remaining, remaining));
     };
@@ -122,7 +122,7 @@ async function readWaitCondition(condition: WaitCondition) {
     else if (g.System?.resolve && g.System?.get) cc = g.System.get(await g.System.resolve("cc"));
     if (!cc?.director?.getScene) throw new Error("Cocos condition waiting is unsupported");
     const scene = cc.director.getScene();
-    if (!scene) throw new Error("Cocos scene is unavailable");
+    if (!scene) return { satisfied: false, present: false, sceneReady: false };
     const nodes: { node: any; path: string }[] = [];
     const stack = [{ node: scene, path: `/${scene.name}` }];
     while (stack.length) {
@@ -167,8 +167,8 @@ async function readWaitCondition(condition: WaitCondition) {
 
 export async function waitForCondition(
     page: PageTransport, identity: PageIdentity, command: WaitCommand, validateTarget: (remainingMs: number) => Promise<unknown>,
+    started = performance.now(),
 ) {
-    const started = performance.now();
     const deadline = started + command.timeoutMs;
     const boundedPage = deadlineTransport(page, deadline);
     let initial: Awaited<ReturnType<typeof observePage>> | undefined;
@@ -260,6 +260,15 @@ function keyDescription(key: string): { key: string; code: string; windowsVirtua
     return { key: key === "Space" ? " " : key, code: value[0] as string, windowsVirtualKeyCode: value[1] as number, modifier: value[2] as number };
 }
 
+function modifiedKeyDescription(key: string, modifiers: number): ReturnType<typeof keyDescription> {
+    const description = keyDescription(key);
+    if (modifiers & 8) {
+        if (/^[a-zA-Z]$/.test(key)) description.key = key.toUpperCase();
+        if (/^[0-9]$/.test(key)) description.key = ")!@#$%^&*("[Number(key)];
+    }
+    return description;
+}
+
 // Executed inside the Cocos page. Browser input still performs normal hit testing.
 async function projectUiNode(point: InputPoint) {
     const g = globalThis as any;
@@ -307,13 +316,14 @@ async function resolvePoint(page: PageTransport, point: InputPoint, width: numbe
 }
 
 export async function sendInput(page: PageTransport, identity: PageIdentity, command: InputCommand,
-    validateTarget: (remainingMs: number) => Promise<unknown>) {
-    const deadline = performance.now() + command.timeoutMs;
+    validateTarget: (remainingMs: number) => Promise<unknown>, startedAt = performance.now()) {
+    const deadline = startedAt + command.timeoutMs;
     const boundedPage = deadlineTransport(page, deadline);
     const current = await observePage(boundedPage, identity);
     const expected = command.observation;
     if (expected.targetId !== identity.targetId || expected.instanceId !== identity.instanceId
         || expected.documentId !== current.observation.documentId) throw new Error("Stale page observation; screenshot again");
+    if (expected.refreshGeneration !== identity.refreshGeneration) throw new Error("Stale refresh generation; screenshot again");
     if (expected.geometryKey !== current.observation.geometryKey) throw new Error("Stale screenshot geometry; screenshot again");
     const point = command.point ? await resolvePoint(boundedPage, command.point, current.viewport.width, current.viewport.height) : undefined;
     const end = command.to ? await resolvePoint(boundedPage, command.to, current.viewport.width, current.viewport.height) : point;
@@ -343,12 +353,12 @@ export async function sendInput(page: PageTransport, identity: PageIdentity, com
         if (!focused) throw new Error("Owned page did not acquire keyboard/input focus");
         if (command.action === "key") {
             for (const key of command.keys!) {
-                const desc = keyDescription(key);
+                const desc = modifiedKeyDescription(key, modifiers);
                 modifiers |= desc.modifier;
                 heldKeys.push(desc); started = true;
                 const { modifier, ...params } = desc;
                 await send("Input.dispatchKeyEvent", { type: "keyDown", ...params, modifiers,
-                    ...(key.length === 1 && !(modifiers & 7) ? { text: key } : {}) });
+                    ...(desc.key.length === 1 && !(modifiers & 7) ? { text: desc.key } : {}) });
             }
             await pause(command.durationMs);
         } else {

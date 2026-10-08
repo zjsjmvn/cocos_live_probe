@@ -44,6 +44,7 @@ interface ReadyResult {
 
 interface DefaultDependencyOptions {
     readonly cdpOrigin: string;
+    readonly getDeadline: () => number | undefined;
     readonly lockPath: string;
     readonly sharedTargetLockPath: string;
     readonly lockTimeoutMs: number;
@@ -315,6 +316,7 @@ export class RuntimeProbeService {
     private navigationUnsubscribe: (() => void) | undefined;
     private documentLoader: string | undefined;
     private explicitRefresh = false;
+    private operationDeadline: number | undefined;
     private ready = false;
     private scene: string | null = null;
     private dispatchTail: Promise<void> = Promise.resolve();
@@ -341,6 +343,7 @@ export class RuntimeProbeService {
         this.managedPreviewUrl = buildManagedPreviewUrl(this.previewUrl, this.instanceId);
         const defaultDependencyOptions: DefaultDependencyOptions = {
             cdpOrigin: this.cdpOrigin,
+            getDeadline: () => this.operationDeadline,
             lockPath: options.chromeLaunchLockPath
                 ?? workspaceDefaults.chromeLaunchLockPath,
             sharedTargetLockPath: options.sharedTargetLockPath
@@ -381,45 +384,11 @@ export class RuntimeProbeService {
 
     private async dispatchCommand(command: RuntimeProbeCommand): Promise<unknown> {
         switch (command.kind) {
-            case "diagnostics": {
-                const validated = parseInteractionCommand("diagnostics", Object.fromEntries(Object.entries(command).filter(([key]) => key !== "kind")));
-                if (validated.kind !== "diagnostics") throw new Error("Invalid diagnostics command");
-                if (!this.targetId) {
-                    await this.requirePreview();
-                    await this.createOwnedTarget(true, false);
-                }
-                const evaluator = await this.getEvaluatorForOwnedTarget();
-                if (!evaluator.send || !evaluator.onEvent) throw new Error("Browser diagnostics transport is unsupported");
-                return { targetId: this.targetId, instanceId: this.instanceId, refreshGeneration: this.refreshGeneration,
-                    capturedAt: new Date().toISOString(), ...this.diagnostics.read(validated) };
-            }
-            case "wait": {
-                const validated = parseInteractionCommand("wait", Object.fromEntries(Object.entries(command).filter(([key]) => key !== "kind")));
-                if (validated.kind !== "wait") throw new Error("Invalid wait command");
-                const evaluator = await this.ensureEvaluator();
-                if (!evaluator.send || !evaluator.onEvent) throw new Error("Browser interaction transport is unsupported");
-                return waitForCondition(evaluator as PageTransport, {
-                    targetId: this.targetId!, instanceId: this.instanceId, refreshGeneration: this.refreshGeneration,
-                }, validated, remainingMs => this.resolveOwnedTarget(remainingMs));
-            }
-            case "input": {
-                const validated = parseInteractionCommand("input", Object.fromEntries(Object.entries(command).filter(([key]) => key !== "kind")));
-                if (validated.kind !== "input") throw new Error("Invalid input command");
-                const evaluator = await this.ensureEvaluator();
-                if (!evaluator.send || !evaluator.onEvent) throw new Error("Browser interaction transport is unsupported");
-                return sendInput(evaluator as PageTransport, {
-                    targetId: this.targetId!, instanceId: this.instanceId, refreshGeneration: this.refreshGeneration,
-                }, validated, remainingMs => this.resolveOwnedTarget(remainingMs));
-            }
-            case "screenshot": {
-                const validated = parseInteractionCommand("screenshot", Object.fromEntries(Object.entries(command).filter(([key]) => key !== "kind")));
-                if (validated.kind !== "screenshot") throw new Error("Invalid screenshot command");
-                const evaluator = await this.ensureEvaluator();
-                if (!evaluator.send || !evaluator.onEvent) throw new Error("Browser interaction transport is unsupported");
-                return captureScreenshot(evaluator as PageTransport, {
-                    targetId: this.targetId!, instanceId: this.instanceId, refreshGeneration: this.refreshGeneration,
-                }, this.artifactDirectory, validated.outputPath);
-            }
+            case "diagnostics":
+            case "wait":
+            case "input":
+            case "screenshot":
+                return this.dispatchInteraction(command);
             case "status":
                 return this.status();
             case "launch":
@@ -443,6 +412,51 @@ export class RuntimeProbeService {
             case "eval-file":
                 return command.captureDiagnostics ? this.evaluateWithDiagnostics(this.dependencies.readTextFile(command.path))
                     : this.evaluateExpression(this.dependencies.readTextFile(command.path));
+        }
+    }
+
+    private async dispatchInteraction(command: InteractionCommand): Promise<unknown> {
+        const { kind, ...args } = command;
+        const validated = parseInteractionCommand(kind, args);
+        const started = performance.now();
+        const timed = validated.kind === "input" || validated.kind === "wait";
+        this.operationDeadline = timed ? started + validated.timeoutMs : undefined;
+        const identity = () => ({ targetId: this.targetId ?? null, instanceId: this.instanceId,
+            refreshGeneration: this.refreshGeneration });
+        let evaluator: RuntimeProbeEvaluator;
+        try {
+            if (!this.targetId) {
+                await this.requirePreview();
+                this.checkOperationDeadline();
+                await this.createOwnedTarget(true, false);
+            }
+            evaluator = await this.getEvaluatorForOwnedTarget();
+            if (validated.kind !== "diagnostics" && !this.ready) evaluator = await this.waitForCocosReady(evaluator);
+            this.checkOperationDeadline();
+            if (!evaluator.send || !evaluator.onEvent) throw new Error("Browser interaction transport is unsupported");
+        } catch (error) {
+            if (!timed || performance.now() < this.operationDeadline!) throw error;
+            return { ...identity(), capturedAt: new Date().toISOString(), elapsedMs: performance.now() - started,
+                ...(validated.kind === "wait" ? { status: "timeout", condition: validated.condition, observation: null }
+                    : { status: "failed", located: false, started: false, completed: false, cleanupConfirmed: true,
+                        error: "Input total timeout exceeded during preparation" }) };
+        } finally {
+            // Cleanup must remain possible after the input's execution budget expires.
+            this.operationDeadline = undefined;
+        }
+        const pageIdentity = { ...identity(), targetId: this.targetId! };
+        const page = evaluator as PageTransport;
+        switch (validated.kind) {
+            case "diagnostics": return { ...pageIdentity, capturedAt: new Date().toISOString(), ...this.diagnostics.read(validated) };
+            case "screenshot": return captureScreenshot(page, pageIdentity, this.artifactDirectory, validated.outputPath);
+            case "wait": return waitForCondition(page, pageIdentity, validated, remaining => this.resolveOwnedTarget(remaining), started);
+            case "input": return sendInput(page, pageIdentity, validated, remaining => this.resolveOwnedTarget(remaining), started);
+        }
+    }
+
+    private checkOperationDeadline(): void {
+        if (this.operationDeadline !== undefined && performance.now() >= this.operationDeadline) {
+            throw new Error("Operation total timeout exceeded during preparation");
         }
     }
 
@@ -620,7 +634,7 @@ export class RuntimeProbeService {
             await this.resolveOwnedTarget();
         }
         const evaluator = await this.getEvaluatorForOwnedTarget();
-        if (!this.ready) await this.waitForCocosReady(evaluator);
+        if (!this.ready) return this.waitForCocosReady(evaluator);
         return evaluator;
     }
 
@@ -705,7 +719,11 @@ export class RuntimeProbeService {
             this.targetTitle = undefined;
             this.ready = false;
             this.scene = null;
-            if (contextId) {
+            if (this.operationDeadline !== undefined) {
+                browser.dispose();
+                this.browserClient = undefined;
+                this.browserContextId = undefined;
+            } else if (contextId) {
                 try {
                     await browser.disposeBrowserContext(contextId);
                 } catch {
@@ -732,10 +750,12 @@ export class RuntimeProbeService {
         try {
             socketUrl = await this.dependencies.getBrowserWebSocketUrl(this.cdpOrigin);
         } catch {
+            this.checkOperationDeadline();
             socketUrl = await this.dependencies.withChromeLaunchLock(async () => {
                 try {
                     return await this.dependencies.getBrowserWebSocketUrl(this.cdpOrigin);
                 } catch {
+                    this.checkOperationDeadline();
                     const executable = resolveChromeExecutable(
                         this.chromeCandidates,
                         this.dependencies.fileExists,
@@ -765,9 +785,11 @@ export class RuntimeProbeService {
             } catch (error) {
                 lastError = asError(error);
             }
+            this.checkOperationDeadline();
             const remaining = deadline - this.dependencies.nowMs();
             if (remaining <= 0) break;
-            await this.dependencies.sleep(Math.min(this.pollIntervalMs, remaining));
+            await this.dependencies.sleep(Math.min(this.pollIntervalMs, remaining, this.operationDeadline === undefined
+                ? Infinity : Math.max(1, this.operationDeadline - performance.now())));
         } while (this.dependencies.nowMs() <= deadline);
         throw new Error(
             `Chrome did not expose its browser CDP WebSocket within ${this.launchTimeoutMs}ms${
@@ -812,9 +834,11 @@ export class RuntimeProbeService {
                 lastError = asError(error);
                 if (error instanceof OwnedTargetMismatchError) throw error;
             }
+            this.checkOperationDeadline();
             const remaining = deadline - this.dependencies.nowMs();
             if (remaining <= 0) break;
-            await this.dependencies.sleep(Math.min(this.pollIntervalMs, remaining));
+            await this.dependencies.sleep(Math.min(this.pollIntervalMs, remaining, this.operationDeadline === undefined
+                ? Infinity : Math.max(1, this.operationDeadline - performance.now())));
         } while (this.dependencies.nowMs() <= deadline);
         throw new Error(
             `Owned runtime probe target did not become discoverable within ${this.launchTimeoutMs}ms${
@@ -900,7 +924,7 @@ export class RuntimeProbeService {
         return new OwnedTargetMismatchError(message);
     }
 
-    private async waitForCocosReady(initialEvaluator: RuntimeProbeEvaluator): Promise<void> {
+    private async waitForCocosReady(initialEvaluator: RuntimeProbeEvaluator): Promise<RuntimeProbeEvaluator> {
         const deadline = this.dependencies.nowMs() + this.readyTimeoutMs;
         let lastError: Error | undefined;
         let evaluator = initialEvaluator;
@@ -911,7 +935,7 @@ export class RuntimeProbeService {
                 if (ready.ready) {
                     this.ready = true;
                     this.scene = ready.scene;
-                    return;
+                    return evaluator;
                 }
             } catch (error) {
                 lastError = asError(error);
@@ -924,9 +948,11 @@ export class RuntimeProbeService {
             }
             this.ready = false;
             this.scene = null;
+            this.checkOperationDeadline();
             const remaining = deadline - this.dependencies.nowMs();
             if (remaining <= 0) break;
-            await this.dependencies.sleep(Math.min(this.pollIntervalMs, remaining));
+            await this.dependencies.sleep(Math.min(this.pollIntervalMs, remaining, this.operationDeadline === undefined
+                ? Infinity : Math.max(1, this.operationDeadline - performance.now())));
         } while (this.dependencies.nowMs() <= deadline);
 
         throw new Error(
@@ -1158,9 +1184,16 @@ function defaultChromeCandidates(env: NodeJS.ProcessEnv = process.env): string[]
     ];
 }
 
+function dependencyTimeout(options: DefaultDependencyOptions, timeoutMs: number): number {
+    const deadline = options.getDeadline();
+    const remaining = deadline === undefined ? timeoutMs : Math.min(timeoutMs, deadline - performance.now());
+    if (remaining <= 0) throw new Error("Operation total timeout exceeded during preparation");
+    return Math.max(1, Math.ceil(remaining));
+}
+
 function createDefaultDependencies(options: DefaultDependencyOptions): RuntimeProbeDependencies {
     const getBrowserWebSocketUrl = async (cdpOrigin: string): Promise<string> => {
-        const response = await fetch(`${cdpOrigin}/json/version`, { signal: AbortSignal.timeout(5000) });
+        const response = await fetch(`${cdpOrigin}/json/version`, { signal: AbortSignal.timeout(dependencyTimeout(options, 5000)) });
         if (!response.ok) {
             throw new Error(`CDP browser discovery failed with HTTP ${response.status}`);
         }
@@ -1174,14 +1207,14 @@ function createDefaultDependencies(options: DefaultDependencyOptions): RuntimePr
     return {
         checkPreview: async previewUrl => {
             try {
-                const response = await fetch(previewUrl, { method: "GET", signal: AbortSignal.timeout(5000) });
+                const response = await fetch(previewUrl, { method: "GET", signal: AbortSignal.timeout(dependencyTimeout(options, 5000)) });
                 return response.ok;
             } catch {
                 return false;
             }
         },
         listTargets: async (cdpOrigin, timeoutMs = 5000) => {
-            const response = await fetch(`${cdpOrigin}/json/list`, { signal: AbortSignal.timeout(Math.max(1, Math.floor(timeoutMs))) });
+            const response = await fetch(`${cdpOrigin}/json/list`, { signal: AbortSignal.timeout(dependencyTimeout(options, timeoutMs)) });
             if (!response.ok) {
                 throw new Error(`CDP target discovery failed with HTTP ${response.status}`);
             }
@@ -1197,7 +1230,7 @@ function createDefaultDependencies(options: DefaultDependencyOptions): RuntimePr
         ),
         withSharedTargetLock: operation => withRuntimeProbeFileLock(
             options.sharedTargetLockPath,
-            options.lockTimeoutMs,
+            dependencyTimeout(options, options.lockTimeoutMs),
             options.pollIntervalMs,
             operation,
         ),
@@ -1210,8 +1243,8 @@ function createDefaultDependencies(options: DefaultDependencyOptions): RuntimePr
             });
             child.unref();
         },
-        createBrowserClient: webSocketDebuggerUrl => new CdpBrowserClient(webSocketDebuggerUrl),
-        createEvaluator: webSocketDebuggerUrl => new CdpRuntimeProbe(webSocketDebuggerUrl),
+        createBrowserClient: webSocketDebuggerUrl => new CdpBrowserClient(webSocketDebuggerUrl, { getDeadline: options.getDeadline }),
+        createEvaluator: webSocketDebuggerUrl => new CdpRuntimeProbe(webSocketDebuggerUrl, { getDeadline: options.getDeadline }),
         readTextFile: filePath => fs.readFileSync(filePath, "utf8"),
         randomUUID,
         nowMs: Date.now,
@@ -1226,7 +1259,7 @@ async function withChromeLaunchLock<T>(
 ): Promise<T> {
     return withRuntimeProbeFileLock(
         options.lockPath,
-        options.lockTimeoutMs,
+        dependencyTimeout(options, options.lockTimeoutMs),
         options.pollIntervalMs,
         operation,
         async () => {
@@ -1248,7 +1281,7 @@ async function withRuntimeProbeFileLock<T>(
     operation: () => Promise<T>,
     onWait?: () => Promise<void>,
 ): Promise<T> {
-    const deadline = Date.now() + lockTimeoutMs;
+    const deadline = performance.now() + lockTimeoutMs;
     while (true) {
         const owner = tryAcquireChromeLaunchLock(lockPath);
         if (owner) {
@@ -1261,7 +1294,7 @@ async function withRuntimeProbeFileLock<T>(
 
         await onWait?.();
         tryTakeOverStaleChromeLaunchLock(lockPath);
-        const remaining = deadline - Date.now();
+        const remaining = deadline - performance.now();
         if (remaining <= 0) {
             throw new Error(`Timed out waiting for runtime probe lock at ${lockPath}`);
         }

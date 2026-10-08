@@ -4,6 +4,7 @@ import * as os from "os";
 import * as path from "path";
 import { runInNewContext } from "vm";
 import { webcrypto } from "crypto";
+import { createServer } from "http";
 import { parseRuntimeProbeArgs, runtimeProbeOptionsFromEnv, RuntimeProbeService } from "../runtime-probe";
 import { handleRuntimeProbeMcpMessage } from "../runtime-probe-mcp";
 
@@ -25,6 +26,7 @@ function environment() {
     globals.clicks = 0;
     globals.loaderId = "loader-1";
     globals.keysHeld = new Set();
+    globals.keyEvents = [];
     const evaluator = {
         evaluate: async (expression: string) => runInNewContext(expression, globals),
         reload: async (accepted?: () => void) => { accepted?.(); },
@@ -35,6 +37,7 @@ function environment() {
                 throw new Error("Injected external protocol failure");
             }
             if (method === "Input.dispatchKeyEvent") {
+                globals.keyEvents.push(params);
                 if (params?.type === "keyDown") globals.keysHeld.add(params.key);
                 if (params?.type === "keyUp") globals.keysHeld.delete(params.key);
             }
@@ -66,7 +69,24 @@ function environment() {
                 disposeBrowserContext: async () => {}, dispose: () => {},
                 getVersion: async () => ({ product: "Chrome/151", protocolVersion: "1.3" }),
             }),
-            createEvaluator: () => evaluator,
+            createEvaluator: () => {
+                let disposed = false;
+                return { ...evaluator,
+                    dispose: () => { disposed = true; },
+                    evaluate: async (expression: string) => {
+                        if (disposed) throw new Error("Disposed fixture evaluator");
+                        if (globals.failReadyOnce && expression.includes("ready: Boolean")) {
+                            globals.failReadyOnce = false;
+                            throw new Error("Execution context destroyed during initial navigation");
+                        }
+                        return evaluator.evaluate(expression);
+                    },
+                    send: async (method: string, params?: Readonly<Record<string, unknown>>) => {
+                        if (disposed) throw new Error("Disposed fixture evaluator");
+                        return evaluator.send(method, params);
+                    },
+                };
+            },
         },
     });
     return { service, globals, emit: (method: string, params: unknown) => {
@@ -75,6 +95,40 @@ function environment() {
 }
 
 async function main(): Promise<void> {
+    const slowPreview = createServer(() => { /* Simulate a preview that never responds. */ });
+    await new Promise<void>(resolve => slowPreview.listen(0, "127.0.0.1", resolve));
+    const port = (slowPreview.address() as { port: number }).port;
+    const slowService = new RuntimeProbeService({ previewUrl: `http://127.0.0.1:${port}/` });
+    try {
+        const started = performance.now();
+        const result = await slowService.dispatch(parseRuntimeProbeArgs(["wait", JSON.stringify({
+            condition: { type: "node-exists", selector: "anything" }, timeoutMs: 100,
+        })])) as any;
+        assert.strictEqual(result.status, "timeout");
+        assert.ok(performance.now() - started < 500, "preparation must share the request timeout");
+        assert.ok(result.elapsedMs >= 90, "elapsed time includes preparation");
+    } finally {
+        await slowService.dispose();
+        slowPreview.closeAllConnections();
+        await new Promise<void>(resolve => slowPreview.close(() => resolve()));
+    }
+    const loading = environment();
+    loading.globals.cc.director.getScene = () => null;
+    try {
+        const started = performance.now();
+        const result = await loading.service.dispatch(parseRuntimeProbeArgs(["wait", JSON.stringify({
+            condition: { type: "node-exists", selector: "anything" }, timeoutMs: 40,
+        })])) as any;
+        assert.strictEqual(result.status, "timeout");
+        assert.ok(performance.now() - started < 300, "Cocos readiness must share the request timeout");
+        assert.ok(result.elapsedMs >= 35);
+    } finally { await loading.service.dispose(); }
+    const reconnecting = environment();
+    reconnecting.globals.failReadyOnce = true;
+    try {
+        const result = await reconnecting.service.dispatch(parseRuntimeProbeArgs(["screenshot"])) as any;
+        assert.strictEqual(result.imageWidth, 1, "initial navigation recovery uses the replacement evaluator");
+    } finally { await reconnecting.service.dispose(); }
     assert.deepStrictEqual(runtimeProbeOptionsFromEnv({
         COCOS_RUNTIME_PROBE_BROWSER_EXECUTABLE: " C:\\Browser With Spaces\\chrome.exe ",
     }), { browserExecutable: "C:\\Browser With Spaces\\chrome.exe" });
@@ -105,6 +159,16 @@ async function main(): Promise<void> {
         assert.strictEqual(response.result.content[0].mimeType, "image/png");
         assert.strictEqual(JSON.parse(response.result.content[1].text).targetId, "page-1");
         const input = { action: "click", device: "mouse", point: { x: 100, y: 120 }, observation: screenshot.observation };
+        for (const [key, expected] of [["a", "A"], ["1", "!"]]) {
+            const shifted = await fixture.service.dispatch(parseRuntimeProbeArgs(["input", JSON.stringify({
+                action: "key", keys: ["Shift", key], durationMs: 0, observation: screenshot.observation,
+            })])) as any;
+            assert.strictEqual(shifted.status, "sent");
+            assert.ok(fixture.globals.keyEvents.some((event: any) => event.type === "keyDown"
+                && event.key === expected && event.text === expected && event.modifiers === 8));
+            assert.ok(fixture.globals.keyEvents.some((event: any) => event.type === "keyUp" && event.key === expected));
+            assert.strictEqual(fixture.globals.keysHeld.size, 0);
+        }
         const clicked = await fixture.service.dispatch(parseRuntimeProbeArgs(["input", JSON.stringify(input)])) as any;
         assert.strictEqual(clicked.status, "sent");
         assert.strictEqual(fixture.globals.clicks, 1);
@@ -149,6 +213,10 @@ async function main(): Promise<void> {
         assert.ok(withLogs.diagnostics.startedAt);
         assert.ok(withLogs.elapsedMs >= 0);
         const fresh = await fixture.service.dispatch(parseRuntimeProbeArgs(["screenshot", JSON.stringify({ outputPath })])) as any;
+        await assert.rejects(fixture.service.dispatch(parseRuntimeProbeArgs(["input", JSON.stringify({
+            action: "click", device: "mouse", point: { x: 30, y: 30 },
+            observation: { ...fresh.observation, refreshGeneration: fresh.observation.refreshGeneration + 1 },
+        })])), /stale.*generation/i);
         fixture.globals.failMethod = "Input.dispatchMouseEvent";
         fixture.globals.failEventType = "mouseMoved";
         const failedDrag = await fixture.service.dispatch(parseRuntimeProbeArgs(["input", JSON.stringify({

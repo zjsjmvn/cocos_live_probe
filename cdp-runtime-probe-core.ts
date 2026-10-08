@@ -52,6 +52,7 @@ export interface RuntimeProbeSocket {
 export interface CdpCommandClientOptions {
     readonly createSocket?: (url: string) => RuntimeProbeSocket;
     readonly timeoutMs?: number;
+    readonly getDeadline?: () => number | undefined;
 }
 
 export type CdpRuntimeProbeOptions = CdpCommandClientOptions;
@@ -371,6 +372,7 @@ interface PageFrameNavigatedEvent {
 export class CdpCommandClient {
     private readonly createSocket: (url: string) => RuntimeProbeSocket;
     private readonly timeoutMs: number;
+    private readonly getDeadline: () => number | undefined;
     private readonly pending = new Map<number, PendingRequest>();
     private readonly pendingEvents = new Set<PendingEvent>();
     private readonly listeners = new Map<string, Set<(params: unknown) => void>>();
@@ -385,6 +387,7 @@ export class CdpCommandClient {
     ) {
         this.createSocket = options.createSocket ?? defaultSocketFactory;
         this.timeoutMs = options.timeoutMs ?? DEFAULT_CDP_TIMEOUT_MS;
+        this.getDeadline = options.getDeadline ?? (() => undefined);
     }
 
     public async send<TResult>(
@@ -392,7 +395,14 @@ export class CdpCommandClient {
         params: Readonly<Record<string, unknown>> = {},
         timeoutMs: number = this.timeoutMs,
     ): Promise<TResult> {
-        await this.ensureConnected();
+        const deadline = Math.min(performance.now() + timeoutMs, this.getDeadline() ?? Infinity);
+        const remaining = () => {
+            const budget = Math.ceil(deadline - performance.now());
+            if (budget <= 0) throw new Error(`CDP ${method} timed out before sending`);
+            return budget;
+        };
+        await this.ensureConnected(remaining());
+        timeoutMs = remaining();
         const socket = this.socket;
         if (!socket || socket.readyState !== 1) {
             throw new Error("CDP socket is not connected");
@@ -462,10 +472,18 @@ export class CdpCommandClient {
         this.listeners.clear();
     }
 
-    private async ensureConnected(): Promise<void> {
+    private async ensureConnected(timeoutMs = this.timeoutMs): Promise<void> {
         if (this.disposed) throw new Error("CDP command client was disposed");
         if (this.socket?.readyState === 1) return;
-        if (this.connecting) return this.connecting;
+        if (this.connecting) {
+            let timer: ReturnType<typeof setTimeout> | undefined;
+            try {
+                await Promise.race([this.connecting, new Promise<never>((_, reject) => {
+                    timer = setTimeout(() => reject(new Error("CDP socket connection timed out")), timeoutMs);
+                })]);
+            } finally { if (timer) clearTimeout(timer); }
+            return;
+        }
 
         const socket = this.createSocket(this.webSocketDebuggerUrl);
         this.socket = socket;
@@ -487,10 +505,10 @@ export class CdpCommandClient {
             };
             const timer = setTimeout(() => {
                 fail(
-                    new Error(`CDP socket connection timed out after ${this.timeoutMs}ms`),
+                    new Error(`CDP socket connection timed out after ${timeoutMs}ms`),
                     true,
                 );
-            }, this.timeoutMs);
+            }, timeoutMs);
             socket.addEventListener("open", () => {
                 if (settled || this.socket !== socket) return;
                 settled = true;

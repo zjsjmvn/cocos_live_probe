@@ -588,6 +588,24 @@ async function verifyCdpClient(): Promise<void> {
     assert.strictEqual(browserSocket!.readyState, 3);
 
     const failedSocket = new ManualSocket();
+    const slowConnection = new ManualSocket();
+    const boundedClient = new CdpCommandClient("ws://127.0.0.1/slow", {
+        createSocket: () => slowConnection, timeoutMs: 2000,
+    });
+    const connectionStarted = performance.now();
+    await assert.rejects(boundedClient.send("Runtime.evaluate", {}, 30), /connection timed out/);
+    assert.ok(performance.now() - connectionStarted < 300, "per-request timeout bounds the initial connection");
+    assert.strictEqual(slowConnection.sent.length, 0);
+    boundedClient.dispose();
+    const delayedConnection = new ManualSocket();
+    const totalClient = new CdpCommandClient("ws://127.0.0.1/delayed", {
+        createSocket: () => { setTimeout(() => delayedConnection.open(), 80); return delayedConnection; },
+        timeoutMs: 2000,
+    });
+    const totalStarted = performance.now();
+    await assert.rejects(totalClient.send("Runtime.evaluate", {}, 160), /timed out/);
+    assert.ok(performance.now() - totalStarted < 215, "response uses the budget remaining after connection");
+    totalClient.dispose();
     const connectedSocket = new ManualSocket();
     const reconnectSockets = [failedSocket, connectedSocket];
     let reconnectSocketIndex = 0;
