@@ -3,6 +3,8 @@ import { createHash, randomUUID } from "crypto";
 import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
+import { captureScreenshot, InteractionCommand, PageTransport, parseInteractionCommand, sendInput, waitForCondition } from "./runtime-interaction";
+import { RuntimeDiagnostics } from "./runtime-diagnostics";
 import {
     buildCocosProbeExpression,
     CdpBrowserClient,
@@ -63,6 +65,7 @@ class OwnedTargetLostError extends Error {}
 class OwnedTargetMismatchError extends Error {}
 
 export type RuntimeProbeCommand =
+    | InteractionCommand
     | { readonly kind: "status" | "launch" | "refresh" }
     | {
         readonly kind: "scene-tree";
@@ -82,10 +85,12 @@ export type RuntimeProbeCommand =
     | {
         readonly kind: "eval";
         readonly expression: string;
+        readonly captureDiagnostics?: boolean;
     }
     | {
         readonly kind: "eval-file";
         readonly path: string;
+        readonly captureDiagnostics?: boolean;
     };
 
 export interface ChromeLaunchOptions {
@@ -95,22 +100,25 @@ export interface ChromeLaunchOptions {
 }
 
 export interface RuntimeProbeEvaluator {
+    send?(method: string, params?: Readonly<Record<string, unknown>>, timeoutMs?: number): Promise<unknown>;
+    onEvent?(method: string, listener: (params: unknown) => void): () => void;
     evaluate(expression: string): Promise<unknown>;
     reload(onAccepted?: () => void): Promise<void>;
     dispose(): void;
 }
 
 export interface RuntimeProbeBrowserClient {
+    getVersion?(): Promise<unknown>;
     createBrowserContext(): Promise<string>;
     createTarget(url: string, browserContextId?: string): Promise<string>;
-    getTargetInfo(targetId: string): Promise<CdpTargetInfo>;
+    getTargetInfo(targetId: string, timeoutMs?: number): Promise<CdpTargetInfo>;
     disposeBrowserContext(browserContextId: string): Promise<void>;
     dispose(): void;
 }
 
 export interface RuntimeProbeDependencies {
     readonly checkPreview: (previewUrl: string) => Promise<boolean>;
-    readonly listTargets: (cdpOrigin: string) => Promise<readonly CdpTarget[]>;
+    readonly listTargets: (cdpOrigin: string, timeoutMs?: number) => Promise<readonly CdpTarget[]>;
     readonly getBrowserWebSocketUrl: (cdpOrigin: string) => Promise<string>;
     readonly withChromeLaunchLock: <T>(operation: () => Promise<T>) => Promise<T>;
     readonly withSharedTargetLock: <T>(operation: () => Promise<T>) => Promise<T>;
@@ -125,6 +133,7 @@ export interface RuntimeProbeDependencies {
 }
 
 export interface RuntimeProbeServiceOptions {
+    readonly browserExecutable?: string;
     readonly workspaceRoot?: string;
     readonly previewUrl?: string;
     readonly cdpOrigin?: string;
@@ -152,6 +161,16 @@ export type RuntimeProbeServiceFactory = (
 export function parseRuntimeProbeArgs(argv: readonly string[]): RuntimeProbeCommand {
     const [command, ...args] = argv;
     switch (command) {
+        case "screenshot":
+        case "input":
+        case "wait":
+        case "diagnostics":
+            if (args[0] === "--file") {
+                if (args.length !== 2) throw new Error(`${command} --file requires one JSON file path`);
+                return parseInteractionCommand(command, JSON.parse(fs.readFileSync(args[1], "utf8").replace(/^\uFEFF/, "")));
+            }
+            if (args.length > 1) throw new Error(`${command} accepts one JSON argument object`);
+            return parseInteractionCommand(command, args[0] ? JSON.parse(args[0]) : {});
         case "status":
         case "launch":
         case "refresh":
@@ -169,12 +188,14 @@ export function parseRuntimeProbeArgs(argv: readonly string[]): RuntimeProbeComm
         case "sample-animation":
             return parseSampleAnimationArgs(args);
         case "eval": {
-            const expression = args.join(" ").trim();
+            const captureDiagnostics = args[0] === "--diagnostics";
+            const expression = (captureDiagnostics ? args.slice(1) : args).join(" ").trim();
             if (!expression) throw new Error("eval requires a JavaScript expression");
-            return { kind: "eval", expression };
+            return { kind: "eval", expression, ...(captureDiagnostics ? { captureDiagnostics: true } : {}) };
         }
         case "eval-file":
-            return { kind: "eval-file", path: requireSingleValue(command, args) };
+            return { kind: "eval-file", path: requireSingleValue(command, args[0] === "--diagnostics" ? args.slice(1) : args),
+                ...(args[0] === "--diagnostics" ? { captureDiagnostics: true } : {}) };
         case undefined:
             throw new Error("Runtime probe requires a command");
         default:
@@ -273,6 +294,8 @@ export class RuntimeProbeService {
     private readonly cdpOrigin: string;
     private readonly chromeProfileDirectory: string;
     private readonly chromeCandidates: readonly string[];
+    private readonly browserExecutable: string | undefined;
+    private readonly artifactDirectory: string;
     private readonly launchTimeoutMs: number;
     private readonly readyTimeoutMs: number;
     private readonly pollIntervalMs: number;
@@ -286,6 +309,12 @@ export class RuntimeProbeService {
     private targetId: string | undefined;
     private targetTitle: string | undefined;
     private refreshGeneration = 0;
+    private readonly diagnostics = new RuntimeDiagnostics();
+    private browserVersion: unknown = null;
+    private launchedExecutable: string | null = null;
+    private navigationUnsubscribe: (() => void) | undefined;
+    private documentLoader: string | undefined;
+    private explicitRefresh = false;
     private ready = false;
     private scene: string | null = null;
     private dispatchTail: Promise<void> = Promise.resolve();
@@ -294,11 +323,14 @@ export class RuntimeProbeService {
 
     public constructor(options: RuntimeProbeServiceOptions = {}) {
         const workspaceDefaults = createRuntimeProbeWorkspaceDefaults(options.workspaceRoot);
+        this.artifactDirectory = path.join(os.tmpdir(), `cocos-live-probe-${workspaceDefaults.identity}-artifacts`);
         this.previewUrl = options.previewUrl ?? DEFAULT_PREVIEW_URL;
         this.cdpOrigin = options.cdpOrigin ?? DEFAULT_CDP_ORIGIN;
         this.chromeProfileDirectory = options.chromeProfileDirectory
             ?? workspaceDefaults.chromeProfileDirectory;
-        this.chromeCandidates = options.chromeCandidates ?? defaultChromeCandidates();
+        this.browserExecutable = options.browserExecutable ?? (process.env.COCOS_RUNTIME_PROBE_BROWSER_EXECUTABLE?.trim() || undefined);
+        this.chromeCandidates = this.browserExecutable
+            ? [this.browserExecutable] : options.chromeCandidates ?? defaultChromeCandidates();
         this.launchTimeoutMs = options.launchTimeoutMs ?? 10_000;
         this.readyTimeoutMs = options.readyTimeoutMs ?? 10_000;
         this.pollIntervalMs = options.pollIntervalMs ?? 100;
@@ -349,6 +381,45 @@ export class RuntimeProbeService {
 
     private async dispatchCommand(command: RuntimeProbeCommand): Promise<unknown> {
         switch (command.kind) {
+            case "diagnostics": {
+                const validated = parseInteractionCommand("diagnostics", Object.fromEntries(Object.entries(command).filter(([key]) => key !== "kind")));
+                if (validated.kind !== "diagnostics") throw new Error("Invalid diagnostics command");
+                if (!this.targetId) {
+                    await this.requirePreview();
+                    await this.createOwnedTarget(true, false);
+                }
+                const evaluator = await this.getEvaluatorForOwnedTarget();
+                if (!evaluator.send || !evaluator.onEvent) throw new Error("Browser diagnostics transport is unsupported");
+                return { targetId: this.targetId, instanceId: this.instanceId, refreshGeneration: this.refreshGeneration,
+                    capturedAt: new Date().toISOString(), ...this.diagnostics.read(validated) };
+            }
+            case "wait": {
+                const validated = parseInteractionCommand("wait", Object.fromEntries(Object.entries(command).filter(([key]) => key !== "kind")));
+                if (validated.kind !== "wait") throw new Error("Invalid wait command");
+                const evaluator = await this.ensureEvaluator();
+                if (!evaluator.send || !evaluator.onEvent) throw new Error("Browser interaction transport is unsupported");
+                return waitForCondition(evaluator as PageTransport, {
+                    targetId: this.targetId!, instanceId: this.instanceId, refreshGeneration: this.refreshGeneration,
+                }, validated, remainingMs => this.resolveOwnedTarget(remainingMs));
+            }
+            case "input": {
+                const validated = parseInteractionCommand("input", Object.fromEntries(Object.entries(command).filter(([key]) => key !== "kind")));
+                if (validated.kind !== "input") throw new Error("Invalid input command");
+                const evaluator = await this.ensureEvaluator();
+                if (!evaluator.send || !evaluator.onEvent) throw new Error("Browser interaction transport is unsupported");
+                return sendInput(evaluator as PageTransport, {
+                    targetId: this.targetId!, instanceId: this.instanceId, refreshGeneration: this.refreshGeneration,
+                }, validated, remainingMs => this.resolveOwnedTarget(remainingMs));
+            }
+            case "screenshot": {
+                const validated = parseInteractionCommand("screenshot", Object.fromEntries(Object.entries(command).filter(([key]) => key !== "kind")));
+                if (validated.kind !== "screenshot") throw new Error("Invalid screenshot command");
+                const evaluator = await this.ensureEvaluator();
+                if (!evaluator.send || !evaluator.onEvent) throw new Error("Browser interaction transport is unsupported");
+                return captureScreenshot(evaluator as PageTransport, {
+                    targetId: this.targetId!, instanceId: this.instanceId, refreshGeneration: this.refreshGeneration,
+                }, this.artifactDirectory, validated.outputPath);
+            }
             case "status":
                 return this.status();
             case "launch":
@@ -368,11 +439,10 @@ export class RuntimeProbeService {
             case "sample-animation":
                 return this.sampleAnimation(command);
             case "eval":
-                return this.evaluateExpression(command.expression);
+                return command.captureDiagnostics ? this.evaluateWithDiagnostics(command.expression) : this.evaluateExpression(command.expression);
             case "eval-file":
-                return this.evaluateExpression(
-                    this.dependencies.readTextFile(command.path),
-                );
+                return command.captureDiagnostics ? this.evaluateWithDiagnostics(this.dependencies.readTextFile(command.path))
+                    : this.evaluateExpression(this.dependencies.readTextFile(command.path));
         }
     }
 
@@ -386,6 +456,8 @@ export class RuntimeProbeService {
         return {
             preview: { available: previewAvailable, url: this.previewUrl },
             cdp: { available: cdpAvailable, url: this.cdpOrigin },
+            browser: { version: this.browserVersion, configuredExecutable: this.browserExecutable ?? null,
+                launchedExecutable: this.launchedExecutable, executableAppliesTo: "new launches only" },
             instance: {
                 id: this.instanceId,
                 ownership: this.ownership,
@@ -455,12 +527,15 @@ export class RuntimeProbeService {
         this.ready = false;
         this.scene = null;
         try {
+            this.explicitRefresh = true;
             await evaluator.reload(() => {
                 this.refreshGeneration += 1;
             });
         } catch (error) {
             if (this.evaluator === evaluator) this.closeEvaluator();
             throw error;
+        } finally {
+            this.explicitRefresh = false;
         }
         await this.resolveOwnedTarget();
         await this.waitForCocosReady(await this.getEvaluatorForOwnedTarget());
@@ -485,6 +560,20 @@ export class RuntimeProbeService {
             if (this.evaluator === evaluator) this.closeEvaluator();
             throw error;
         }
+    }
+
+    private async evaluateWithDiagnostics(expression: string): Promise<unknown> {
+        const evaluator = await this.ensureEvaluator();
+        if (!evaluator.send || !evaluator.onEvent) throw new Error("Browser diagnostics transport is unsupported");
+        const after = this.diagnostics.read({ limit: 1000 }).nextCursor;
+        const started = performance.now();
+        let result: unknown;
+        let error: string | undefined;
+        try { result = await evaluator.evaluate(expression); }
+        catch (failure) { error = asError(failure).message; }
+        return { status: error ? "failed" : "completed", result: result ?? null, elapsedMs: performance.now() - started,
+            ...(error ? { error } : {}), diagnostics: this.diagnostics.read({ after, limit: 1000 }),
+            targetId: this.targetId, instanceId: this.instanceId, refreshGeneration: this.refreshGeneration };
     }
 
     private async sampleAnimation(
@@ -542,30 +631,50 @@ export class RuntimeProbeService {
             this.closeEvaluator();
             this.evaluator = this.dependencies.createEvaluator(socketUrl);
             this.evaluatorSocketUrl = socketUrl;
+            if (this.evaluator.onEvent) {
+                this.navigationUnsubscribe = this.evaluator.onEvent("Page.frameNavigated", params => {
+                    const frame = (params as { frame?: { parentId?: string; loaderId?: string } }).frame;
+                    if (!frame || frame.parentId !== undefined || !frame.loaderId) return;
+                    if (this.documentLoader && this.documentLoader !== frame.loaderId) {
+                        if (!this.explicitRefresh) this.refreshGeneration++;
+                        this.ready = false; this.scene = null;
+                    }
+                    this.documentLoader = frame.loaderId;
+                });
+            }
+        }
+        if (this.evaluator.send && this.evaluator.onEvent) {
+            await this.diagnostics.attach(this.evaluator as PageTransport, () => ({
+                targetId: this.targetId!, instanceId: this.instanceId, refreshGeneration: this.refreshGeneration,
+            }));
+            if (!this.documentLoader) {
+                const tree = await this.evaluator.send("Page.getFrameTree") as { frameTree?: { frame?: { loaderId?: string } } };
+                this.documentLoader = tree.frameTree?.frame?.loaderId;
+            }
         }
         return this.evaluator;
     }
 
-    private async createOwnedTarget(allowSharedReuse: boolean): Promise<OwnedTargetCreation> {
+    private async createOwnedTarget(allowSharedReuse: boolean, waitUntilReady = true): Promise<OwnedTargetCreation> {
         const browser = await this.ensureBrowserClient();
         if (this.ownership === "shared" && allowSharedReuse) {
             const shared = await this.findSharedTarget(browser);
-            if (shared) return this.attachSharedTarget(shared);
+            if (shared) return this.attachSharedTarget(shared, waitUntilReady);
             const ownership = await this.dependencies.withSharedTargetLock(async () => {
                 const claimed = await this.findSharedTarget(browser);
                 if (claimed) return this.bindSharedTarget(claimed);
                 return this.createNewOwnedTarget(browser, false);
             });
-            await this.waitForCocosReady(await this.getEvaluatorForOwnedTarget());
+            if (waitUntilReady) await this.waitForCocosReady(await this.getEvaluatorForOwnedTarget());
             return ownership;
         }
 
-        return this.createNewOwnedTarget(browser);
+        return this.createNewOwnedTarget(browser, waitUntilReady);
     }
 
-    private async attachSharedTarget(shared: CdpTarget): Promise<OwnedTargetCreation> {
+    private async attachSharedTarget(shared: CdpTarget, waitUntilReady = true): Promise<OwnedTargetCreation> {
         const ownership = this.bindSharedTarget(shared);
-        await this.waitForCocosReady(await this.getEvaluatorForOwnedTarget());
+        if (waitUntilReady) await this.waitForCocosReady(await this.getEvaluatorForOwnedTarget());
         return ownership;
     }
 
@@ -616,6 +725,9 @@ export class RuntimeProbeService {
 
     private async ensureBrowserClient(): Promise<RuntimeProbeBrowserClient> {
         if (this.browserClient) return this.browserClient;
+        if (this.browserExecutable && !this.dependencies.fileExists(this.browserExecutable)) {
+            throw new Error(`Configured browser executable was not found: ${this.browserExecutable}`);
+        }
         let socketUrl: string;
         try {
             socketUrl = await this.dependencies.getBrowserWebSocketUrl(this.cdpOrigin);
@@ -634,11 +746,13 @@ export class RuntimeProbeService {
                         debuggingPort: Number(cdpUrl.port),
                         profileDirectory: this.chromeProfileDirectory,
                     }));
+                    this.launchedExecutable = executable;
                     return this.waitForBrowserWebSocket();
                 }
             });
         }
         this.browserClient = this.dependencies.createBrowserClient(socketUrl);
+        this.browserVersion = this.browserClient.getVersion ? await this.browserClient.getVersion() : null;
         return this.browserClient;
     }
 
@@ -709,14 +823,16 @@ export class RuntimeProbeService {
         );
     }
 
-    private async resolveOwnedTarget(): Promise<CdpTarget> {
+    private async resolveOwnedTarget(timeoutMs?: number): Promise<CdpTarget> {
+        const deadline = timeoutMs === undefined ? undefined : performance.now() + timeoutMs;
+        const remaining = () => deadline === undefined ? undefined : Math.max(1, Math.floor(deadline - performance.now()));
         if (!this.targetId || !this.browserClient) {
             throw this.ownedTargetLost("Owned runtime probe target was lost");
         }
 
         let info: CdpTargetInfo;
         try {
-            info = await this.browserClient.getTargetInfo(this.targetId);
+            info = await this.browserClient.getTargetInfo(this.targetId, remaining());
         } catch (error) {
             throw this.ownedTargetLost(
                 `Owned runtime probe target was lost: ${asError(error).message}`,
@@ -748,7 +864,7 @@ export class RuntimeProbeService {
 
         let targets: readonly CdpTarget[];
         try {
-            targets = await this.dependencies.listTargets(this.cdpOrigin);
+            targets = await this.dependencies.listTargets(this.cdpOrigin, remaining());
         } catch (error) {
             throw this.ownedTargetLost(
                 `Owned runtime probe target was lost during discovery: ${asError(error).message}`,
@@ -829,6 +945,10 @@ export class RuntimeProbeService {
     }
 
     private closeEvaluator(): void {
+        this.navigationUnsubscribe?.();
+        this.navigationUnsubscribe = undefined;
+        this.documentLoader = undefined;
+        this.diagnostics.detach();
         this.evaluator?.dispose();
         this.evaluator = undefined;
         this.evaluatorSocketUrl = undefined;
@@ -891,7 +1011,9 @@ export async function runRuntimeProbeCli(
     });
     try {
         const result = await service.dispatch(parseRuntimeProbeArgs(argv));
-        writeOutput(`${JSON.stringify(result, null, 2)}\n`);
+        const output = result && typeof result === "object" && "image" in result
+            ? Object.fromEntries(Object.entries(result).filter(([key]) => key !== "image")) : result;
+        writeOutput(`${JSON.stringify(output, null, 2)}\n`);
     } finally {
         await service.dispose();
     }
@@ -906,7 +1028,10 @@ export async function runRuntimeProbeCli(
 export function runtimeProbeOptionsFromEnv(
     env: NodeJS.ProcessEnv = process.env,
 ): RuntimeProbeServiceOptions {
-    const options: { previewUrl?: string; cdpOrigin?: string } = {};
+    const options: { previewUrl?: string; cdpOrigin?: string; browserExecutable?: string } = {};
+    if (env.COCOS_RUNTIME_PROBE_BROWSER_EXECUTABLE?.trim()) {
+        options.browserExecutable = env.COCOS_RUNTIME_PROBE_BROWSER_EXECUTABLE.trim();
+    }
     if (env.COCOS_RUNTIME_PROBE_PREVIEW_URL?.trim()) {
         options.previewUrl = env.COCOS_RUNTIME_PROBE_PREVIEW_URL.trim();
     }
@@ -1035,7 +1160,7 @@ function defaultChromeCandidates(env: NodeJS.ProcessEnv = process.env): string[]
 
 function createDefaultDependencies(options: DefaultDependencyOptions): RuntimeProbeDependencies {
     const getBrowserWebSocketUrl = async (cdpOrigin: string): Promise<string> => {
-        const response = await fetch(`${cdpOrigin}/json/version`);
+        const response = await fetch(`${cdpOrigin}/json/version`, { signal: AbortSignal.timeout(5000) });
         if (!response.ok) {
             throw new Error(`CDP browser discovery failed with HTTP ${response.status}`);
         }
@@ -1049,14 +1174,14 @@ function createDefaultDependencies(options: DefaultDependencyOptions): RuntimePr
     return {
         checkPreview: async previewUrl => {
             try {
-                const response = await fetch(previewUrl, { method: "GET" });
+                const response = await fetch(previewUrl, { method: "GET", signal: AbortSignal.timeout(5000) });
                 return response.ok;
             } catch {
                 return false;
             }
         },
-        listTargets: async cdpOrigin => {
-            const response = await fetch(`${cdpOrigin}/json/list`);
+        listTargets: async (cdpOrigin, timeoutMs = 5000) => {
+            const response = await fetch(`${cdpOrigin}/json/list`, { signal: AbortSignal.timeout(Math.max(1, Math.floor(timeoutMs))) });
             if (!response.ok) {
                 throw new Error(`CDP target discovery failed with HTTP ${response.status}`);
             }

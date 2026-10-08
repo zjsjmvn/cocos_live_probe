@@ -8,7 +8,8 @@
     "runtime:probe:mcp": "ts-node -P tsconfig.json runtime-probe-mcp.ts --stdio",
     "runtime:probe:mcp:http": "ts-node -P tsconfig.json runtime-probe-mcp.ts --http",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "test": "ts-node -P tsconfig.json test/runtime-probe.test.ts"
+    "test": "ts-node -P tsconfig.json test/runtime-probe.test.ts && ts-node -P tsconfig.json test/runtime-interaction.test.ts",
+    "test:browser": "ts-node -P tsconfig.json test/runtime-browser-smoke.ts"
   },
   "devDependencies": {
     "@types/node": "^22.15.29",

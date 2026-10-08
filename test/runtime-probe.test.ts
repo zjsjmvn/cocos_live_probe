@@ -1308,6 +1308,10 @@ async function verifyRuntimeProbeMcp(): Promise<void> {
     assert.deepStrictEqual(
         list.result.tools.map(tool => tool.name),
         [
+            "runtime_input",
+            "runtime_wait",
+            "runtime_diagnostics",
+            "runtime_screenshot",
             "runtime_status",
             "runtime_launch",
             "runtime_refresh",

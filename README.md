@@ -29,7 +29,7 @@ CLI manual-cli / HTTP MCP 单实例 ---------> 各自的受管页面
 - Cocos Creator 已打开宿主项目，并已启动目标场景的浏览器预览。
 - 预览地址可通过 `http://127.0.0.1:7456/` 访问。
 - 已安装 Node.js 22 或更新版本，并在本工具目录执行过 `npm ci`。
-- Windows 上已安装 Google Chrome；工具会从常见的用户或 Program Files 路径查找 `chrome.exe`。
+- Windows 上已安装 Google Chrome 或 Chromium。可设置 `COCOS_RUNTIME_PROBE_BROWSER_EXECUTABLE` 指定可执行文件；未设置时从常见用户/Program Files 路径查找 Chrome。
 - 本地端口 `9222` 用于 CDP；启用 HTTP MCP 时还需要端口 `3001`。
 
 ## 快速开始
@@ -89,6 +89,10 @@ npm run runtime:probe -- sample-animation "<active-player-node-uuid>" --duration
 | `sample-animation` | selector、`--duration`、`--interval` | 连续读取动画快照；默认 `1s / 0.1s`。 |
 | `eval` | JavaScript 表达式 | 在预览 target 中执行高级诊断表达式。 |
 | `eval-file` | JavaScript 文件路径 | 读取文件并在预览 target 中执行。 |
+| `screenshot` | 可选 JSON 对象或 `--file <JSON文件>` | 保存视口 PNG，返回尺寸、缩放和输入观察凭据。 |
+| `input` | JSON 对象或 `--file <JSON文件>` | 浏览器鼠标/触摸点击、长按、拖动和键盘输入。 |
+| `wait` | JSON 对象或 `--file <JSON文件>` | 有界等待节点存在/消失或节点/组件属性条件。 |
+| `diagnostics` | 可选 JSON 对象或 `--file <JSON文件>` | 读取本连接期间的 console、异常和网络失败。 |
 
 采样时长必须大于 `0` 且不超过 `30s`；间隔不得小于 `0.01s`，不得大于总时长，单次最多 `301` 个样本。
 
@@ -158,8 +162,98 @@ stdio MCP 暴露以下工具：
 | `runtime_node_snapshot` | `node` |
 | `runtime_animation_snapshot` | `animations` |
 | `runtime_sample_animation` | `sample-animation` |
+| `runtime_screenshot` | `screenshot` |
+| `runtime_input` | `input` |
+| `runtime_wait` | `wait` |
+| `runtime_diagnostics` | `diagnostics` |
 
 出于安全边界考虑，MCP 不暴露通用 `eval` 或 `eval-file`。
+
+## Chromium 与浏览器信息
+
+使用已经安装的有窗口 Chromium 时，将 `COCOS_RUNTIME_PROBE_BROWSER_EXECUTABLE` 设置为实际 `chrome.exe` 的绝对路径。明确配置的文件不存在时直接报错。服务选项 `browserExecutable` 优先于环境配置；未配置时保留 Chrome 自动发现。环境变量也可放入 stdio MCP 的启动环境。
+
+版本固定可采用选定且锁定版本的 Playwright 安装命令：`npx playwright@<选定版本> install chromium --no-shell`，然后配置下载所得可执行文件。工具不自动安装或升级浏览器，也不假定 Playwright 缓存中的版本目录。
+
+`launch` 返回实际浏览器的 `Browser.getVersion` 信息、CDP 地址和 target。`browser.configuredExecutable` 只影响本工具新发起的启动；复用一个已经监听 CDP 的浏览器不会改变它的版本。`browser.launchedExecutable` 仅在当前服务确实启动了浏览器时有值。`status` 继续是可用性检查与缓存状态，不隐式启动或恢复页面。
+
+## 截图、真实输入与等待
+
+先截图取得 `observation`，再把它原样传给输入。CLI 默认复用 `manual-cli` 页面，所以不同 CLI 进程可使用同一文档的凭据。使用 `COCOS_RUNTIME_PROBE_OWNERSHIP=isolated` 时，每次 CLI 调用结束都释放页面，适合单次诊断；连续交互应使用长期 MCP 服务或 CLI shared 模式。
+
+PowerShell 示例使用 JSON 文件避免原生命令参数的引号问题：
+
+```powershell
+$shot = npm run --silent runtime:probe -- screenshot | ConvertFrom-Json
+$payload = @{
+  action = 'click'
+  device = 'mouse'
+  point = @{ x = 200; y = 300 }
+  observation = $shot.observation
+}
+$payload | ConvertTo-Json -Depth 8 | Set-Content -Encoding utf8 input.json
+npm run --silent runtime:probe -- input --file input.json
+```
+
+截图是视口 PNG，MCP 直接返回 `image` 内容块与元数据文本，CLI 返回图片绝对路径。元数据包含图片像素尺寸、视口 CSS 尺寸、devicePixelRatio、visual viewport 的缩放/偏移、Canvas 边界和 Cocos 能力信息。CSS 坐标以页面视口左上角为原点；图片像素不能简单当作 CSS 像素。没有 pinch 缩放时，按图片/视口尺寸比例换算；visual viewport 有缩放时，应结合其 CSS 宽高和偏移换算，或直接使用节点 UUID 定位。
+
+默认图片保存到 `%TEMP%/cocos-live-probe-<workspace-id>-artifacts`，按旧到新保留最多 100 张、总计 100 MiB。只有本工具默认目录受自动清理；指定 `outputPath` 时由调用者管理文件。可在确认不再需要后清理该默认产物目录。
+
+输入参数：
+
+| 参数 | 说明 |
+| --- | --- |
+| `action` | `click`、`long-press`、`drag`、`key`。 |
+| `device` | 指针操作必须为 `mouse` 或 `touch`；一次操作只发送一种输入。 |
+| `observation` | 当前截图返回的完整观察凭据；包含 target、实例、刷新代次、文档身份和几何指纹。 |
+| `point` | `{ "x": 200, "y": 300 }` 或 `{ "uuid": "节点UUID" }`。 |
+| `to` | 拖动终点，格式与 `point` 相同。 |
+| `keys` | 键盘操作的按键列表，如 `["Control", "a"]`；最多 8 个，不重复。 |
+| `durationMs` | 最多 20000；点击默认 0，其他操作默认 500。 |
+| `timeoutMs` | 总时限默认 10000，范围 100..30000，须大于 durationMs；失败清理另有短暂上限。 |
+
+支持字母、数字，以及 Control/Shift/Alt/Meta、Enter/Escape/Tab/Backspace/Delete、ArrowLeft/Up/Right/Down、Space、Home/End/PageUp/PageDown。键盘输入先让受管页面获得焦点；不支持的键在发送前报错。
+
+UUID 定位首轮面向 Cocos 3.8 UITransform 节点，计算节点中心的相机投影，再转换为 CSS 坐标。多相机时提供 `cameraUuid`，多 Canvas 时提供 `canvasId`；这些字段放在 UUID point 对象中。节点失效、inactive、无法投影、坐标越界或无法唯一选择时拒绝操作。任意 3D 对象定位和多指手势不在本轮范围内。
+
+所有操作经过 CDP Input 和正常命中测试；不会绕过 Cocos 或 DOM 弹窗遮挡。`status=sent` 表示定位和输入发送/释放完成，业务是否成功须通过现有查询或 `wait` 验证。部分发送后不重试；失败返回 `started`、`completed`、`cleanupConfirmed` 和错误。连接失去时可能无法确认释放，结果会明确说明。
+
+显式刷新、人工 F5、导航、target 更换，以及视口/Canvas 几何变化后，旧观察凭据被拒绝。重新截图后再操作；场景切换需重新查询节点 UUID。动态对象在同一文档内移动仍需调用者判断最新位置，凭据不冻结游戏画面。
+
+等待参数为 `condition`、`timeoutMs`（默认 5000，最多 30000）和 `intervalMs`（默认 100，范围 10..1000）：
+
+```json
+{ "condition": { "type": "node-exists", "selector": "Dialog" } }
+```
+
+```json
+{ "condition": { "type": "property", "selector": "节点UUID", "component": "cc.Button", "path": "interactable", "operator": "eq", "value": true }, "timeoutMs": 5000 }
+```
+
+存在性条件支持 `node-exists` / `node-absent`，inactive 节点仍存在。属性条件要求唯一节点，component 可省略以直接读取节点属性；path 为只读属性路径，不接受方法调用或任意 JS。比较支持 eq/ne/gt/gte/lt/lte，值为 JSON 基本类型；有序比较只接受数值。属性/组件缺失、歧义或版本不支持明确报错。条件超时返回 `status=timeout`、最后观察值及耗时；页面丢失或文档变化另报错误。MCP 把输入失败或等待超时标记为工具错误，并保留结构化结果。
+
+等待占用当前会话队列。先发送输入再等待，不能用排在等待后面的同会话命令使条件成立。本轮不提供引擎帧等待。
+
+## 持续诊断与脚本反馈
+
+连接 target 后自动订阅 console、运行时异常、未处理 Promise 拒绝、Network 传输失败和 HTTP 4xx/5xx。它不要求活动场景就绪。诊断结果包含 `startedAt`、连接状态、target/文档代次、事件时间、可用调用栈及增量游标；未提供的栈或 URL 不会补造。
+
+`diagnostics` 可传 `after` 游标、`limit`（默认 100，最多 1000）、`types` 和 `levels`。类型为 console/exception/promise-rejection/network-failure/http-error/gap；级别为 log/info/warn/error/debug。读取不清空缓冲区。将 `nextCursor` 用作后续 `after`；`hasMore=true` 时继续分页。游标早于保留范围会显示 `cursorGap`，丢弃数量在 `dropped` 中。
+
+容量同时限制为 1000 条、总计 2 MiB、单条 16 KiB；对象按深度和成员数截断，循环引用和超长内容有标记，不保留远程对象句柄或网络响应体。断连、重连和刷新保留原文档标记，并报告采集空档。
+
+长期 stdio/HTTP MCP 在服务连接期间持续采集；CLI 每次只有自身连接期间的记录，不提供跨进程日志历史。`startedAt` 不能证明订阅之前没有错误，也不保证恢复页面启动早期日志。
+
+CLI 既有 eval 输出默认保持不变。需要一次取得脚本结果、耗时、日志及异常时，显式添加 `--diagnostics`：
+
+```powershell
+npm run --silent runtime:probe -- eval --diagnostics '(() => { console.warn("probe"); return { ready: true }; })()'
+npm run --silent runtime:probe -- eval-file --diagnostics diagnostic.js
+```
+
+这些选项返回 `{ status, result, elapsedMs, diagnostics, targetId, instanceId, refreshGeneration }`。脚本异常为 `status=failed`，不假定脚本状态修改能自动回滚；异步记录只有在返回之前发生才属于本次反馈。MCP 仍不暴露任意 eval。
+
+运行 `npm test` 和 `npm run typecheck` 验证公共命令/协议行为。`npm run test:browser` 另需正在运行的 Creator 预览与独立 CDP 浏览器；它在独占上下文里创建通用 Cocos 场景，验证截图、真实输入、遮挡、缩放、等待、诊断、场景切换和旧凭据拒绝。跨进程 CLI 验收要求该浏览器没有已有 manual-cli 页面；测试创建的 CLI 页面会在结束时关闭。
 
 人工检查 stdio 握手：
 

@@ -11,6 +11,18 @@ import {
 type JsonRpcId = number | string | null;
 type RuntimeProbeDispatch = (command: RuntimeProbeCommand) => Promise<unknown>;
 
+const observationSchema = {
+    type: "object", properties: {
+        targetId: { type: "string", minLength: 1 }, instanceId: { type: "string", minLength: 1 },
+        refreshGeneration: { type: "integer", minimum: 0 }, documentId: { type: "string", minLength: 1 },
+        geometryKey: { type: "string", minLength: 1 },
+    }, required: ["targetId", "instanceId", "refreshGeneration", "documentId", "geometryKey"], additionalProperties: false,
+};
+const pointSchema = { oneOf: [
+    { type: "object", properties: { x: { type: "number", minimum: 0 }, y: { type: "number", minimum: 0 } }, required: ["x", "y"], additionalProperties: false },
+    { type: "object", properties: { uuid: { type: "string", minLength: 1 }, cameraUuid: { type: "string", minLength: 1 }, canvasId: { type: "string", minLength: 1 } }, required: ["uuid"], additionalProperties: false },
+] };
+
 export const COCOS_LIVE_PROBE_MCP_NAME = "cocos-live-probe";
 
 export interface RuntimeProbeMcpHttpServer extends http.Server {
@@ -46,6 +58,43 @@ interface JsonRpcResponse {
 }
 
 export const RUNTIME_PROBE_MCP_TOOLS: readonly RuntimeProbeMcpTool[] = [
+    {
+        name: "runtime_input",
+        description: "Send real mouse/touch click, long-press, drag or keyboard input to the owned page. Requires current screenshot credentials. Sent input does not prove gameplay success; partial input is never retried.",
+        inputSchema: { type: "object", properties: {
+            action: { type: "string", enum: ["click", "long-press", "drag", "key"] }, device: { type: "string", enum: ["mouse", "touch"] },
+            observation: observationSchema, point: pointSchema, to: pointSchema,
+            keys: { type: "array", minItems: 1, maxItems: 8, uniqueItems: true, items: { type: "string" } },
+            durationMs: { type: "number", minimum: 0, maximum: 20_000 }, timeoutMs: { type: "number", minimum: 100, maximum: 30_000, default: 10_000 },
+        }, required: ["action", "observation"], additionalProperties: false },
+    },
+    {
+        name: "runtime_wait",
+        description: "Wait for a node to appear/disappear or a primitive node/component property condition. Inactive nodes still exist. Same-session commands queued after this wait cannot satisfy it.",
+        inputSchema: { type: "object", properties: {
+            condition: { oneOf: [
+                { type: "object", properties: { type: { enum: ["node-exists", "node-absent"] }, selector: { type: "string", minLength: 1 } }, required: ["type", "selector"], additionalProperties: false },
+                { type: "object", properties: { type: { const: "property" }, selector: { type: "string", minLength: 1 }, component: { type: "string", minLength: 1 },
+                    path: { type: "string", minLength: 1 }, operator: { enum: ["eq", "ne", "gt", "gte", "lt", "lte"] }, value: { type: ["string", "number", "boolean", "null"] } },
+                    required: ["type", "selector", "path", "operator", "value"], additionalProperties: false },
+            ] },
+            timeoutMs: { type: "number", minimum: 1, maximum: 30_000, default: 5000 }, intervalMs: { type: "number", minimum: 10, maximum: 1000, default: 100 },
+        }, required: ["condition"], additionalProperties: false },
+    },
+    {
+        name: "runtime_diagnostics",
+        description: "Read bounded console, exceptions, unhandled Promise rejections and failed network requests collected during this service connection. Returns collection start, gaps, truncation and incremental cursors; cannot recover earlier history.",
+        inputSchema: { type: "object", properties: {
+            after: { type: "integer", minimum: 0 }, limit: { type: "integer", minimum: 1, maximum: 1000, default: 100 },
+            types: { type: "array", items: { enum: ["console", "exception", "promise-rejection", "network-failure", "http-error", "gap"] } },
+            levels: { type: "array", items: { enum: ["log", "info", "warn", "error", "debug"] } },
+        }, additionalProperties: false },
+    },
+    {
+        name: "runtime_screenshot",
+        description: "Capture the owned viewport as a PNG image and return document/geometry credentials for input.",
+        inputSchema: { type: "object", properties: { outputPath: { type: "string", minLength: 1 } }, additionalProperties: false },
+    },
     {
         name: "runtime_status",
         description: "Report preview/CDP availability and this service's cached target state without launching Chrome.",
@@ -288,8 +337,17 @@ async function handleToolCall(
 
     try {
         const value = await dispatch(command);
+        if (value && typeof value === "object" && "image" in value) {
+            const { image, ...metadata } = value as { image: { data: string; mimeType: string } };
+            return jsonRpcResult(id, { content: [
+                { type: "image", ...image },
+                { type: "text", text: JSON.stringify(metadata, null, 2) },
+            ] });
+        }
         return jsonRpcResult(id, {
             content: [{ type: "text", text: JSON.stringify(value ?? null, null, 2) }],
+            ...(value && typeof value === "object" && "status" in value
+                && (value.status === "failed" || value.status === "timeout") ? { isError: true } : {}),
         });
     } catch (error) {
         return jsonRpcResult(id, {
@@ -306,6 +364,12 @@ function commandForToolCall(params: unknown): RuntimeProbeCommand {
         ? {}
         : requireRecord(record.arguments, `${name} arguments`);
     switch (name) {
+        case "runtime_screenshot":
+            return parseRuntimeProbeArgs(["screenshot", JSON.stringify(args)]);
+        case "runtime_input":
+        case "runtime_wait":
+        case "runtime_diagnostics":
+            return parseRuntimeProbeArgs([name.slice("runtime_".length), JSON.stringify(args)]);
         case "runtime_status":
             requireEmptyArguments(name, args);
             return { kind: "status" };

@@ -373,9 +373,11 @@ export class CdpCommandClient {
     private readonly timeoutMs: number;
     private readonly pending = new Map<number, PendingRequest>();
     private readonly pendingEvents = new Set<PendingEvent>();
+    private readonly listeners = new Map<string, Set<(params: unknown) => void>>();
     private socket: RuntimeProbeSocket | undefined;
     private connecting: Promise<void> | undefined;
     private nextRequestId = 1;
+    private disposed = false;
 
     public constructor(
         private readonly webSocketDebuggerUrl: string,
@@ -388,6 +390,7 @@ export class CdpCommandClient {
     public async send<TResult>(
         method: string,
         params: Readonly<Record<string, unknown>> = {},
+        timeoutMs: number = this.timeoutMs,
     ): Promise<TResult> {
         await this.ensureConnected();
         const socket = this.socket;
@@ -400,8 +403,8 @@ export class CdpCommandClient {
         return new Promise<TResult>((resolve, reject) => {
             const timer = setTimeout(() => {
                 this.pending.delete(id);
-                reject(new Error(`CDP ${method} timed out after ${this.timeoutMs}ms`));
-            }, this.timeoutMs);
+                reject(new Error(`CDP ${method} timed out after ${timeoutMs}ms`));
+            }, timeoutMs);
             this.pending.set(id, {
                 method,
                 resolve: value => resolve(value as TResult),
@@ -444,13 +447,23 @@ export class CdpCommandClient {
         });
     }
 
+    public onEvent(method: string, listener: (params: unknown) => void): () => void {
+        const listeners = this.listeners.get(method) ?? new Set();
+        listeners.add(listener);
+        this.listeners.set(method, listeners);
+        return () => { listeners.delete(listener); };
+    }
+
     public dispose(): void {
+        this.disposed = true;
         this.rejectPending(new Error("CDP command client was disposed"));
         this.socket?.close();
         this.connecting = undefined;
+        this.listeners.clear();
     }
 
     private async ensureConnected(): Promise<void> {
+        if (this.disposed) throw new Error("CDP command client was disposed");
         if (this.socket?.readyState === 1) return;
         if (this.connecting) return this.connecting;
 
@@ -531,6 +544,9 @@ export class CdpCommandClient {
     }
 
     private onProtocolEvent(method: string, params: unknown): void {
+        for (const listener of this.listeners.get(method) ?? []) {
+            try { listener(params); } catch { /* An observer must not interrupt protocol responses. */ }
+        }
         for (const pending of [...this.pendingEvents]) {
             if (pending.method !== method) continue;
             let matched = false;
@@ -552,12 +568,14 @@ export class CdpCommandClient {
     private onClose(socket: RuntimeProbeSocket): void {
         if (this.socket !== socket) return;
         this.socket = undefined;
+        this.onProtocolEvent("Probe.disconnected", { reason: "CDP socket closed" });
         this.rejectPending(new Error("CDP socket closed"));
     }
 
     private onSocketError(socket: RuntimeProbeSocket, event: unknown): void {
         if (this.socket !== socket) return;
         this.rejectPending(asError(event, "CDP socket failed"));
+        this.onProtocolEvent("Probe.disconnected", { reason: "CDP socket error" });
     }
 
     private rejectPending(error: Error): void {
@@ -579,6 +597,14 @@ export class CdpRuntimeProbe {
 
     public constructor(webSocketDebuggerUrl: string, options: CdpRuntimeProbeOptions = {}) {
         this.client = new CdpCommandClient(webSocketDebuggerUrl, options);
+    }
+
+    public send(method: string, params?: Readonly<Record<string, unknown>>, timeoutMs?: number): Promise<unknown> {
+        return this.client.send(method, params, timeoutMs);
+    }
+
+    public onEvent(method: string, listener: (params: unknown) => void): () => void {
+        return this.client.onEvent(method, listener);
     }
 
     public async evaluate(expression: string): Promise<unknown> {
@@ -633,6 +659,10 @@ export class CdpBrowserClient {
         this.client = new CdpCommandClient(webSocketDebuggerUrl, options);
     }
 
+    public getVersion(): Promise<unknown> {
+        return this.client.send("Browser.getVersion");
+    }
+
     public async createBrowserContext(): Promise<string> {
         const result = await this.client.send<{ browserContextId?: string }>(
             "Target.createBrowserContext",
@@ -654,10 +684,11 @@ export class CdpBrowserClient {
         return result.targetId;
     }
 
-    public async getTargetInfo(targetId: string): Promise<CdpTargetInfo> {
+    public async getTargetInfo(targetId: string, timeoutMs?: number): Promise<CdpTargetInfo> {
         const result = await this.client.send<{ targetInfo?: CdpTargetInfo }>(
             "Target.getTargetInfo",
             { targetId },
+            timeoutMs,
         );
         if (!result.targetInfo) throw new Error("CDP did not return targetInfo");
         return result.targetInfo;
