@@ -23,16 +23,15 @@ const MIN_SAMPLE_INTERVAL_SECONDS = 0.01;
 const MAX_ANIMATION_SAMPLES = 301;
 const CHROME_LOCK_STALE_GRACE_MS = 5_000;
 const COCOS_READY_EXPRESSION = `(async () => {
-    if (!globalThis.System
-        || typeof globalThis.System.resolve !== "function"
-        || typeof globalThis.System.get !== "function") {
-        return { ready: false, scene: null };
+    let cc = globalThis.cc;
+    if (globalThis.System && typeof globalThis.System.resolve === "function"
+        && typeof globalThis.System.get === "function") {
+        const ccModuleId = await globalThis.System.resolve("cc");
+        cc = globalThis.System.get(ccModuleId);
     }
-    const ccModuleId = await globalThis.System.resolve("cc");
-    const cc = globalThis.System.get(ccModuleId);
     return {
-        ready: Boolean(cc && cc.game?.inited && cc.director.getScene()),
-        scene: cc ? cc.director.getScene()?.name ?? null : null,
+        ready: Boolean(cc && cc.director && cc.director.getScene()),
+        scene: cc && cc.director ? cc.director.getScene()?.name ?? null : null,
     };
 })()`;
 
@@ -313,10 +312,7 @@ export class RuntimeProbeService {
             lockPath: options.chromeLaunchLockPath
                 ?? workspaceDefaults.chromeLaunchLockPath,
             sharedTargetLockPath: options.sharedTargetLockPath
-                ?? defaultSharedTargetLockPath(
-                    this.managedPreviewUrl,
-                    workspaceDefaults.identity,
-                ),
+                ?? defaultSharedTargetLockPath(this.managedPreviewUrl, workspaceDefaults.identity),
             lockTimeoutMs: this.launchTimeoutMs,
             pollIntervalMs: this.pollIntervalMs,
         };
@@ -425,6 +421,24 @@ export class RuntimeProbeService {
 
     private async refresh(): Promise<unknown> {
         await this.requirePreview();
+        // A Creator preview can replace a shared page while the runner is
+        // between probes. In that case the old target id is permanently
+        // invalid, so retry the whole refresh after rebinding to the current
+        // URL-owned page. Isolated targets keep their existing strict
+        // ownership checks and only get this recovery for a genuine loss.
+        for (let attempt = 0; attempt < 2; attempt += 1) {
+            try {
+                return await this.refreshOnce();
+            } catch (error) {
+                if (!(error instanceof OwnedTargetLostError) || attempt > 0) throw error;
+                await this.clearOwnershipForRecovery();
+                await this.createOwnedTarget(this.ownership === "shared");
+            }
+        }
+        throw new Error("Runtime probe refresh recovery exhausted");
+    }
+
+    private async refreshOnce(): Promise<unknown> {
         if (!this.targetId) {
             const ownership = await this.createOwnedTarget(this.ownership === "shared");
             if (ownership.created) {
@@ -662,13 +676,16 @@ export class RuntimeProbeService {
             } catch {
                 continue;
             }
-            if (info.targetId === target.id && info.url === this.managedPreviewUrl
-                && !info.browserContextId) matches.push(target);
+            // Chrome 154 reports a concrete browserContextId for the default
+            // context as well. Shared probes do not own that context, so the
+            // URL is the ownership boundary here; isolated probes still use
+            // the strict context check in resolveOwnedTarget().
+            if (info.targetId === target.id && info.url === this.managedPreviewUrl) matches.push(target);
         }
-        if (matches.length > 1) {
-            throw new Error(`Multiple shared runtime probe targets match ${this.managedPreviewUrl}`);
-        }
-        return matches[0];
+        // A crashed/manual probe can leave duplicate shared pages behind.
+        // Reuse the newest CDP-listed page instead of failing before the
+        // evaluator can inspect the currently loaded preview.
+        return matches.at(-1);
     }
 
     private async waitForOwnedTarget(): Promise<CdpTarget> {
@@ -709,7 +726,8 @@ export class RuntimeProbeService {
             throw this.ownedTargetMismatch("Owned runtime probe target ID mismatch");
         }
         const actualContextId = info.browserContextId;
-        if (actualContextId !== this.browserContextId) {
+        const sharedDefaultContext = this.ownership === "shared" && this.browserContextId === undefined;
+        if (!sharedDefaultContext && actualContextId !== this.browserContextId) {
             throw this.ownedTargetMismatch(
                 `Owned runtime probe context mismatch: expected ${
                     this.browserContextId ?? "default"
@@ -717,6 +735,12 @@ export class RuntimeProbeService {
             );
         }
         if (info.url !== this.managedPreviewUrl) {
+            // Creator-managed navigation briefly reports an empty URL for the
+            // old shared target. That transient state is recoverable; a
+            // non-empty mismatch remains an ownership violation.
+            if (this.ownership === "shared" && !info.url) {
+                throw this.ownedTargetLost("Owned shared runtime probe target is navigating");
+            }
             throw this.ownedTargetMismatch(
                 `Owned runtime probe URL mismatch: expected ${this.managedPreviewUrl}, received ${info.url}`,
             );
@@ -735,6 +759,9 @@ export class RuntimeProbeService {
             throw this.ownedTargetLost("Owned runtime probe target was lost from CDP discovery");
         }
         if (target.url !== this.managedPreviewUrl) {
+            if (this.ownership === "shared" && !target.url) {
+                throw this.ownedTargetLost("Owned shared runtime probe target is navigating");
+            }
             throw this.ownedTargetMismatch(
                 `Owned runtime probe URL mismatch: expected ${this.managedPreviewUrl}, received ${target.url}`,
             );
@@ -855,13 +882,38 @@ export async function runRuntimeProbeCli(
         process.stdout.write(text);
     },
 ): Promise<void> {
-    const service = createService({ ownership: "shared", instanceId: "manual-cli" });
+    const service = createService({
+        ...runtimeProbeOptionsFromEnv(),
+        ownership: process.env.COCOS_RUNTIME_PROBE_OWNERSHIP === "isolated"
+            ? "isolated"
+            : "shared",
+        instanceId: "manual-cli",
+    });
     try {
         const result = await service.dispatch(parseRuntimeProbeArgs(argv));
         writeOutput(`${JSON.stringify(result, null, 2)}\n`);
     } finally {
         await service.dispose();
     }
+}
+
+/**
+ * Resolve optional endpoint overrides for local comparisons. The defaults stay
+ * on the normal Creator preview/CDP ports, while a second preview can be
+ * inspected by setting COCOS_RUNTIME_PROBE_PREVIEW_URL and
+ * COCOS_RUNTIME_PROBE_CDP_ORIGIN.
+ */
+export function runtimeProbeOptionsFromEnv(
+    env: NodeJS.ProcessEnv = process.env,
+): RuntimeProbeServiceOptions {
+    const options: { previewUrl?: string; cdpOrigin?: string } = {};
+    if (env.COCOS_RUNTIME_PROBE_PREVIEW_URL?.trim()) {
+        options.previewUrl = env.COCOS_RUNTIME_PROBE_PREVIEW_URL.trim();
+    }
+    if (env.COCOS_RUNTIME_PROBE_CDP_ORIGIN?.trim()) {
+        options.cdpOrigin = env.COCOS_RUNTIME_PROBE_CDP_ORIGIN.trim();
+    }
+    return options;
 }
 
 function parseSceneTreeArgs(args: readonly string[]): RuntimeProbeCommand {

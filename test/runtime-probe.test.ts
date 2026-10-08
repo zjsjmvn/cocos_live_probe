@@ -4,6 +4,7 @@ import * as http from "http";
 import * as os from "os";
 import * as path from "path";
 import { Readable } from "stream";
+import { runInNewContext } from "vm";
 import {
     buildCocosProbeExpression,
     CdpBrowserClient,
@@ -27,6 +28,7 @@ import {
     RuntimeProbeService,
     RuntimeProbeServiceOptions,
     runRuntimeProbeCli,
+    runtimeProbeOptionsFromEnv,
 } from "../runtime-probe";
 import {
     handleRuntimeProbeMcpMessage,
@@ -679,7 +681,7 @@ class FakeManagedEvaluator implements RuntimeProbeEvaluator {
             hold.started.resolve(undefined);
             await hold.released.promise;
         }
-        if (expression.includes("cc.game") && expression.includes("ready")) {
+        if (expression.includes("ready:") && expression.includes("getScene()")) {
             return { ready: this.ready, scene: this.ready ? "battle" : null };
         }
         return { targetId: this.targetId, expressionIndex: this.expressions.length };
@@ -1057,6 +1059,22 @@ async function verifyRuntimeProbeService(): Promise<void> {
     assert.strictEqual(sharedRefresh.instance.refreshGeneration, 1);
     assert.strictEqual(environment.targetsForInstance("manual-cli").length, 1);
     assert.strictEqual(environment.targetForInstance("manual-cli").evaluator.reloadCount, 1);
+
+    environment.setTargetContext(sharedTargetId, "default-context-chrome-154");
+    const defaultContextRefresh = await sharedSecond.dispatch({ kind: "refresh" }) as ProbeServiceStatus;
+    assert.strictEqual(defaultContextRefresh.instance.target?.id, sharedTargetId,
+        "shared pages may report a concrete default browser context");
+
+    environment.hideTarget(sharedTargetId);
+    const replacementRefresh = await sharedSecond.dispatch({ kind: "refresh" }) as ProbeServiceStatus;
+    assert.notStrictEqual(replacementRefresh.instance.target?.id, sharedTargetId,
+        "refresh must recover when Creator replaces the owned shared target");
+    const replacementRecord = environment.targetForInstance("manual-cli");
+    const ownedUrl = replacementRecord.info.url;
+    replacementRecord.info = { ...replacementRecord.info, url: "http://127.0.0.1:7456/?other-session=true" };
+    await assert.rejects(sharedSecond.dispatch({ kind: "refresh" }), /URL mismatch/,
+        "recovery must not hide a nonempty shared target URL mismatch");
+    replacementRecord.info = { ...replacementRecord.info, url: ownedUrl };
     await sharedSecond.dispose();
 
     const finalContextA = recoveredA.instance.browserContextId!;
@@ -1570,12 +1588,51 @@ function requestJson(url: string): Promise<{ statusCode: number | undefined; bod
     });
 }
 
+async function verifyRuntimeCompatibility(): Promise<void> {
+    function Animation() {}
+    const scene = { name: "scene", children: [] as unknown[], parent: null };
+    const actor = {
+        name: "actor", uuid: "actor-uuid", active: true, _activeInHierarchy: true,
+        children: [], parent: scene,
+        getComponentsInChildren: (type: unknown) => type === Animation ? [animation] : [],
+        getComponent: (type: unknown) => type === Animation ? animation : null,
+    };
+    const animation = {
+        node: actor,
+        clips: [{ name: "idle", duration: 0.5, wrapMode: 2 }],
+        getState: () => ({ duration: 0.5, time: 0.25, speed: 1, isPlaying: true }),
+    };
+    scene.children.push(actor);
+    const cc = { Animation, director: { getScene: () => scene } };
+    const expression = buildCocosProbeExpression({ kind: "animations", selector: "actor-uuid" });
+    for (const globals of [
+        { cc },
+        { System: { import: async () => cc } },
+        { System: { resolve: async () => "cc-module", get: () => cc } },
+    ]) {
+        const result = await runInNewContext(expression, globals);
+        assert.strictEqual(result.node.activeInHierarchy, true);
+        assert.strictEqual(result.animations.length, 1);
+        assert.strictEqual(result.animations[0].componentType, "cc.Animation");
+        assert.strictEqual(result.animations[0].states[0].time, 0.25);
+        assert.strictEqual(result.animations[0].states[0].isPlaying, true);
+        assert.strictEqual(result.animations[0].bip001, null);
+        assert.strictEqual(result.animations[0].renderers.length, 0);
+    }
+    await assert.rejects(runInNewContext(expression, {}), /Cocos runtime global is unavailable/);
+    assert.deepStrictEqual(runtimeProbeOptionsFromEnv({
+        COCOS_RUNTIME_PROBE_PREVIEW_URL: " http://127.0.0.1:7457/ ",
+        COCOS_RUNTIME_PROBE_CDP_ORIGIN: " http://127.0.0.1:9334 ",
+    }), { previewUrl: "http://127.0.0.1:7457/", cdpOrigin: "http://127.0.0.1:9334" });
+}
+
 verifyCdpClient()
     .then(verifyRuntimeProbeService)
     .then(verifyProductionChromeLaunchLock)
     .then(verifySharedTargetCreationLock)
     .then(verifyRuntimeProbeMcp)
     .then(verifyRuntimeProbeLifecycles)
+    .then(verifyRuntimeCompatibility)
     .then(() => console.log("runtime-probe.test passed"))
     .catch(error => {
         console.error(error);

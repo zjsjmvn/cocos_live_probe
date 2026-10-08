@@ -149,7 +149,15 @@ export function buildCocosProbeExpression(request: CocosProbeRequest): string {
     const encodedRequest = JSON.stringify(request);
     return `(async () => {
     const request = ${encodedRequest};
-    const cc = await globalThis.System.import("cc");
+    let cc = globalThis.cc;
+    if (globalThis.System && typeof globalThis.System.import === "function") {
+        cc = await globalThis.System.import("cc");
+    } else if (globalThis.System && typeof globalThis.System.resolve === "function"
+        && typeof globalThis.System.get === "function") {
+        const ccModuleId = await globalThis.System.resolve("cc");
+        cc = globalThis.System.get(ccModuleId);
+    }
+    if (!cc) throw new Error("Cocos runtime global is unavailable");
     const scene = cc.director.getScene();
     if (!scene) throw new Error("Cocos preview has no active scene");
 
@@ -199,7 +207,7 @@ export function buildCocosProbeExpression(request: CocosProbeRequest): string {
         uuid: node.uuid,
         path: pathOf(node),
         active: node.active,
-        activeInHierarchy: node.activeInHierarchy,
+        activeInHierarchy: node.activeInHierarchy ?? node._activeInHierarchy ?? node.active,
         childCount: node.children.length,
     });
     const nodeSnapshot = node => {
@@ -249,8 +257,11 @@ export function buildCocosProbeExpression(request: CocosProbeRequest): string {
         return { ...nodeSummary(node), children };
     };
     const descendantsWithSelf = (node, componentType) => {
-        const values = node.getComponentsInChildren(componentType);
-        const onRoot = node.getComponent(componentType);
+        if (!componentType) return [];
+        const values = node.getComponentsInChildren
+            ? node.getComponentsInChildren(componentType)
+            : [];
+        const onRoot = node.getComponent ? node.getComponent(componentType) : null;
         if (onRoot && !values.includes(onRoot)) values.unshift(onRoot);
         return values;
     };
@@ -261,21 +272,36 @@ export function buildCocosProbeExpression(request: CocosProbeRequest): string {
         return null;
     };
     const animationSnapshot = node => {
-        const animations = descendantsWithSelf(node, cc.SkeletalAnimation);
+        // The original probe only inspected SkeletalAnimation, which made a
+        // valid 2D cc.Animation component look like a missing animation. Keep
+        // both component types in one list so callers can verify either kind.
+        const standardAnimations = descendantsWithSelf(node, cc.Animation)
+            .map(animation => ({ animation, componentType: "cc.Animation" }));
+        const skeletalAnimations = descendantsWithSelf(node, cc.SkeletalAnimation)
+            .map(animation => ({ animation, componentType: "cc.SkeletalAnimation" }));
+        const animations = [...standardAnimations, ...skeletalAnimations];
         return {
             node: nodeSummary(node),
-            animations: animations.map(animation => {
-                const bip = descendantNamed(animation.node, "Bip001");
-                const renderers = descendantsWithSelf(animation.node, cc.SkinnedMeshRenderer);
+            animations: animations.map(({ animation, componentType }) => {
+                const clips = Array.isArray(animation.clips) ? animation.clips : [];
+                const bip = componentType === "cc.SkeletalAnimation"
+                    ? descendantNamed(animation.node, "Bip001")
+                    : null;
+                const renderers = componentType === "cc.SkeletalAnimation"
+                    ? descendantsWithSelf(animation.node, cc.SkinnedMeshRenderer)
+                    : [];
                 return {
+                    componentType,
                     nodePath: pathOf(animation.node),
-                    useBakedAnimation: animation.useBakedAnimation,
-                    clips: animation.clips.map(clip => clip ? {
+                    useBakedAnimation: componentType === "cc.SkeletalAnimation"
+                        ? animation.useBakedAnimation
+                        : null,
+                    clips: clips.map(clip => clip ? {
                         name: clip.name,
                         duration: number(clip.duration),
                         wrapMode: clip.wrapMode,
                     } : null),
-                    states: animation.clips.filter(Boolean).map(clip => {
+                    states: clips.filter(Boolean).map(clip => {
                         const state = animation.getState(clip.name);
                         return state ? {
                             name: clip.name,

@@ -2,6 +2,7 @@ import * as http from "http";
 import * as readline from "readline";
 import {
     parseRuntimeProbeArgs,
+    runtimeProbeOptionsFromEnv,
     RuntimeProbeCommand,
     RuntimeProbeService,
     RuntimeProbeServiceHandle,
@@ -84,12 +85,12 @@ export const RUNTIME_PROBE_MCP_TOOLS: readonly RuntimeProbeMcpTool[] = [
     },
     {
         name: "runtime_animation_snapshot",
-        description: "Read skeletal clips, states, private evaluation diagnostics, Bip001, and skinning bounds.",
+        description: "Read standard or skeletal animation clips and states, plus skeletal evaluation diagnostics and skinning bounds.",
         inputSchema: selectorSchema(),
     },
     {
         name: "runtime_sample_animation",
-        description: "Continuously sample a running skeletal animation and root/bounds state for a bounded duration.",
+        description: "Continuously sample a running standard or skeletal animation and root/bounds state for a bounded duration.",
         inputSchema: {
             type: "object",
             properties: {
@@ -156,7 +157,7 @@ export async function processRuntimeProbeMcpLine(
 }
 
 export async function runRuntimeProbeMcpStdio(
-    service: RuntimeProbeServiceHandle = new RuntimeProbeService(),
+    service: RuntimeProbeServiceHandle = new RuntimeProbeService(runtimeProbeOptionsFromEnv()),
     inputStream: NodeJS.ReadableStream = process.stdin,
     writeOutput: (text: string) => void = text => {
         process.stdout.write(text);
@@ -180,7 +181,7 @@ export async function runRuntimeProbeMcpStdio(
 }
 
 export function createRuntimeProbeMcpHttpServer(
-    service: RuntimeProbeServiceHandle = new RuntimeProbeService(),
+    service: RuntimeProbeServiceHandle = new RuntimeProbeService(runtimeProbeOptionsFromEnv()),
 ): http.Server {
     return http.createServer(async (request, response) => {
         response.setHeader("Content-Type", "application/json; charset=utf-8");
@@ -422,7 +423,7 @@ function asError(value: unknown): Error {
     return value instanceof Error ? value : new Error(String(value));
 }
 
-async function main(argv: readonly string[]): Promise<void> {
+export async function runRuntimeProbeMcpCli(argv: readonly string[]): Promise<void> {
     const mode = argv[0] ?? "--stdio";
     if (mode === "--stdio") {
         await runRuntimeProbeMcpStdio();
@@ -464,7 +465,7 @@ function waitForHttpShutdown(server: RuntimeProbeMcpHttpServer): Promise<void> {
 }
 
 if (require.main === module) {
-    main(process.argv.slice(2)).catch(error => {
+    runRuntimeProbeMcpCli(process.argv.slice(2)).catch(error => {
         process.stderr.write(`${asError(error).message}\n`);
         process.exitCode = 1;
     });

@@ -28,7 +28,7 @@ CLI manual-cli / HTTP MCP 单实例 ---------> 各自的受管页面
 
 - Cocos Creator 已打开宿主项目，并已启动目标场景的浏览器预览。
 - 预览地址可通过 `http://127.0.0.1:7456/` 访问。
-- 已安装 Node.js，并在本工具目录执行过 `npm install`。
+- 已安装 Node.js 22 或更新版本，并在本工具目录执行过 `npm ci`。
 - Windows 上已安装 Google Chrome；工具会从常见的用户或 Program Files 路径查找 `chrome.exe`。
 - 本地端口 `9222` 用于 CDP；启用 HTTP MCP 时还需要端口 `3001`。
 
@@ -39,10 +39,12 @@ CLI manual-cli / HTTP MCP 单实例 ---------> 各自的受管页面
 ```powershell
 git submodule add https://github.com/zjsjmvn/cocos_live_probe.git tools/cocos_live_probe
 cd tools/cocos_live_probe
-npm install
+npm ci
 ```
 
 后续命令都从 `tools/cocos_live_probe` 目录运行：
+
+已有项目重新克隆后，先在项目根目录执行 `git submodule update --init --recursive`，再进入工具目录执行 `npm ci`。子模块固定到宿主项目记录的提交；升级时先在子模块提交并推送，再提交宿主项目的子模块引用。
 
 ```powershell
 # 1. 只检查状态，不启动 Chrome
@@ -205,6 +207,12 @@ Invoke-RestMethod -Method Post -Uri "http://127.0.0.1:3001/mcp" -Headers $header
 HTTP MCP 服务只有一个长期 `RuntimeProbeService`。所有 HTTP 客户端共享同一实例、命令队列和受管 target；它不是按客户端隔离的多会话入口。需要对话级隔离时使用 stdio MCP。
 
 ## 使用建议
+
+CLI、stdio MCP 和 HTTP MCP 均支持 `COCOS_RUNTIME_PROBE_PREVIEW_URL` 与 `COCOS_RUNTIME_PROBE_CDP_ORIGIN`，可分别指定 Creator 资源服务和浏览器 CDP 地址。CLI 默认复用 `manual-cli` 页面，设置 `COCOS_RUNTIME_PROBE_OWNERSHIP=isolated` 可改为一次命令一个隔离上下文；stdio MCP 默认按会话隔离。
+
+`animations` 与 `sample-animation` 同时读取普通 `cc.Animation` 和 `cc.SkeletalAnimation`。运行时既支持 SystemJS 的 `cc` 模块，也支持 `globalThis.cc`；不同版本的私有动画字段可能缺失。
+
+在工具目录运行 `npm run typecheck` 和 `npm test` 验证通用实现。游戏专用的 `eval-file` 脚本与回归 runner 放在宿主项目，使用绝对路径或宿主工作目录下的相对路径执行。
 
 1. 日常 AI 诊断优先使用 `cocos_live_probe` MCP；人工复核或当前会话没有加载 MCP 时使用 CLI。
 2. 先调用 `runtime_status`。只有需要预览数据时才启动 Chrome 或执行结构化查询。
