@@ -35,7 +35,7 @@ export async function deliveryObserver(operation: string, args: any): Promise<an
     } catch { return { hit: "unsupported", completeness: "partial", reason: "engine-unavailable" }; }
     const proto = cc?.Node?.prototype;
     const descriptor = proto && Object.getOwnPropertyDescriptor(proto, "dispatchEvent");
-    if (!descriptor?.value || !descriptor.writable || !g.document?.addEventListener) return { hit: "unsupported", completeness: "partial", reason: "public-event-dispatch-unavailable" };
+    if (!descriptor?.value || !descriptor.writable || !g.document?.addEventListener || !("event" in g)) return { hit: "unsupported", completeness: "partial", reason: "public-event-dispatch-or-DOM-source-unavailable" };
     if (g[key]) return { hit: "unknown", completeness: "partial", reason: "observation-already-active" };
     const original = descriptor.value;
     const state: any = { actionId: args.actionId, device: args.device, nodes: [], events: [], rawEvents: [], unmatchedEvents: [], rawEnd: false,
@@ -54,10 +54,17 @@ export async function deliveryObserver(operation: string, args: any): Promise<an
         if ((args.device === "touch" ? ["touchend", "touchcancel"] : ["mouseup"]).includes(event.type)) state.rawEnd = true;
         const canvas = cc.game?.canvas ?? g.document.querySelector?.("canvas");
         const rect = canvas?.getBoundingClientRect?.();
-        if (state.rawEvents.length < 128) state.rawEvents.push({ type: event.type, x: point.clientX, y: point.clientY,
+        const entry = { type: event.type, x: point.clientX, y: point.clientY,
             pointerId: event.type.startsWith("touch") ? point.identifier : 0,
-            engineX: rect?.width > 0 ? (point.clientX - rect.left) * canvas.width / rect.width : null,
-            engineY: rect?.height > 0 ? (rect.top + rect.height - point.clientY) * canvas.height / rect.height : null });
+            engineX: rect?.width > 0 ? (point.clientX - rect.left) * (cc.screen?.devicePixelRatio ?? g.devicePixelRatio) : null,
+            engineY: rect?.height > 0 ? (rect.top + rect.height - point.clientY) * (cc.screen?.devicePixelRatio ?? g.devicePixelRatio) : null };
+        state.currentRaw = entry;
+        state.currentDomEvent = event;
+        // The supported web engine dispatches synchronously inside this trusted DOM event.
+        // A later callback with identical coordinates is not proof of the same input.
+        // Chromium exposes the currently dispatched DOM event. Microtasks may run
+        // between DOM listeners, so clearing at a microtask would be too early.
+        if (state.rawEvents.length < 128) state.rawEvents.push(entry);
         else state.overflow = true;
     };
     const capture = (node: any, event: any) => {
@@ -67,9 +74,11 @@ export async function deliveryObserver(operation: string, args: any): Promise<an
         const phases: Record<string, string[]> = { "touch-start": ["mousedown", "touchstart"], "mouse-down": ["mousedown", "touchstart"],
             "touch-move": ["mousemove", "touchmove"], "mouse-move": ["mousemove", "touchmove"], "touch-end": ["mouseup", "touchend"],
             "mouse-up": ["mouseup", "touchend"], "touch-cancel": ["mouseup", "mousemove", "touchcancel", "touchend"] };
-        const matched = state.rawEvents.some((raw: any) => phases[event.type]?.includes(raw.type) && raw.pointerId === pointerId
+        const raw = state.currentRaw;
+        const matched = raw && g.event === state.currentDomEvent && state.currentDomEvent?.isTrusted
+            && phases[event.type]?.includes(raw.type) && raw.pointerId === pointerId
             && Number.isFinite(raw.engineX) && Number.isFinite(raw.engineY) && location
-            && Math.abs(location.x - raw.engineX) <= 3 && Math.abs(location.y - raw.engineY) <= 3);
+            && Math.abs(location.x - raw.engineX) <= 3 && Math.abs(location.y - raw.engineY) <= 3;
         if (!matched) { state.interference = true; if (state.unmatchedEvents.length < 8) state.unmatchedEvents.push({ type: event.type, pointerId, location }); return; }
         const target = event.target ?? node;
         const parts = []; let cursor = target;

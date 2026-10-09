@@ -449,7 +449,7 @@ $env:COCOS_RUNTIME_PROBE_EVIDENCE = 'off'
 | `unsupported` | 引擎不支持公开事件分发观察；原输入继续可用 |
 | `not-applicable` | 键盘输入，不适用 UI 指针命中 |
 
-反馈透明观察公开 `Node.dispatchEvent`，不为节点增加触摸监听，不阻止传播。目标按 UUID 去重，递归分发不会重复统计；派生鼠标/触摸阶段保留实际事件路线。最多 32 个目标、128 条事件，超限为 unknown/partial。真实 DOM 输入对应设备/坐标，释放后必须经过 Cocos after-draw 处理边界，才允许认定完整；传输回执本身不能证明 miss。
+反馈透明观察公开 `Node.dispatchEvent`，不为节点增加触摸监听，不阻止传播。目标按 UUID 去重，递归分发不会重复统计；派生鼠标/触摸阶段保留实际事件路线。最多 32 个目标、128 条事件，超限为 unknown/partial。关联时核对 Chromium 当前正在处理的可信 DOM 事件、设备、阶段、指针 ID 与按引擎 DPR 换算的坐标；延迟脚本派发相同坐标的事件不能借用历史输入记录。引擎异步分发或不能可靠确认来源时返回 unknown，不支持当前 DOM 来源观察时返回 unsupported，原输入仍正常执行。释放后还必须经过 Cocos after-draw 处理边界，才允许认定完整；传输回执本身不能证明 miss。
 
 坐标包含视口 CSS 像素、DPR、visualViewport、canvas 的显示/缓冲尺寸，以及引擎事件坐标。截图像素换算使用同一截图回执的 `imageWidth/imageHeight` 与视口尺寸，不把图片像素直接当作 CSS 像素。`sent` 表示发送和释放完成，`hit` 表示收到 UI 事件，购买、领奖和阶段变化仍看游戏 `verify`。全局输入玩法可能在 miss 后正常推进。
 
