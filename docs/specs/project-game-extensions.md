@@ -2,6 +2,8 @@
 
 状态：用户已授权发布及实现；测试采用公共 dispatch 行为、CLI/MCP 协议及 CountRice 真实预览验收。
 
+跟踪事项：[GitHub Issue #2](https://github.com/zjsjmvn/cocos_live_probe/issues/2)。
+
 ## Problem Statement
 
 Cocos Live Probe 已支持场景与节点查询、动画采样、截图、真实浏览器输入、条件等待和持续诊断。开发者希望在单个游戏中增加自动玩、流程验证和游戏状态观察，而不需要把米桶、金币、鸡槽等业务知识加入通用探针，也不必在每次对话中重新解释全部玩法。

@@ -73,6 +73,10 @@ npm run runtime:probe -- sample-animation "<active-player-node-uuid>" --duration
 
 `status` 中的 `instance.target`、`ready` 和 `scene` 是本服务缓存的最近状态，不是一次隐式 target 恢复或页面接管。精确 target ID、BrowserContext ID 和 URL 会在结构化读取、`launch` 与 `refresh` 时重新校验；仅调用 `status` 不代表 target 此刻仍然存活。
 
+## 项目级游戏扩展
+
+宿主项目可以通过 `COCOS_RUNTIME_PROBE_GAME_EXTENSION` 显式加载本地游戏插件，增加 `game_state`、`game_step`、`game_autoplay`（CLI 为连字符命名）。插件使用只读游戏状态和现有真实浏览器输入，始终复用当前会话页面。配置、契约、预算和 CountRice 示例见 [游戏扩展说明](docs/game-extensions.md)。
+
 ## CLI 命令
 
 所有 CLI 调用都使用 `npm run runtime:probe -- <command>`。

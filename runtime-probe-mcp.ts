@@ -153,9 +153,27 @@ export const RUNTIME_PROBE_MCP_TOOLS: readonly RuntimeProbeMcpTool[] = [
     },
 ];
 
+export function runtimeProbeMcpTools(service?: RuntimeProbeServiceHandle): readonly RuntimeProbeMcpTool[] {
+    const extension = service?.game?.extension;
+    if (!extension) return RUNTIME_PROBE_MCP_TOOLS;
+    const shared = { goal: extension.goalSchema, policy: extension.policySchema ?? { type: "object", additionalProperties: false } };
+    const tools: RuntimeProbeMcpTool[] = [
+        { name: "game_state", description: `Read current ${extension.id} state without gameplay input.`,
+            inputSchema: { type: "object", properties: { timeoutMs: { type: "integer", minimum: 1, maximum: 10_000, default: 5000 } }, additionalProperties: false } },
+        { name: "game_step", description: `Observe, decide, send at most one real input and verify ${extension.id} gameplay.`,
+            inputSchema: { type: "object", properties: { ...shared, timeoutMs: { type: "integer", minimum: 1, maximum: 10_000, default: 5000 } }, required: ["goal"], additionalProperties: false } },
+        { name: "game_autoplay", description: `Run a bounded ${extension.id} batch. Returns why it stopped; no background continuation.`,
+            inputSchema: { type: "object", properties: { ...shared, timeoutMs: { type: "integer", minimum: 1, maximum: 30_000, default: 20_000 },
+                maxSteps: { type: "integer", minimum: 1, maximum: 1000, default: 100 },
+                noProgressTimeoutMs: { type: "integer", minimum: 1, maximum: 30_000, default: 5000 } }, required: ["goal"], additionalProperties: false } },
+    ];
+    return [...RUNTIME_PROBE_MCP_TOOLS, ...tools];
+}
+
 export async function handleRuntimeProbeMcpMessage(
     message: unknown,
     dispatch: RuntimeProbeDispatch,
+    service?: RuntimeProbeServiceHandle,
 ): Promise<JsonRpcResponse | undefined> {
     if (!isJsonRpcRequest(message)) {
         return jsonRpcError(null, -32600, "Invalid JSON-RPC 2.0 request");
@@ -178,7 +196,7 @@ export async function handleRuntimeProbeMcpMessage(
         case "ping":
             return jsonRpcResult(message.id, {});
         case "tools/list":
-            return jsonRpcResult(message.id, { tools: RUNTIME_PROBE_MCP_TOOLS });
+            return jsonRpcResult(message.id, { tools: runtimeProbeMcpTools(service) });
         case "tools/call":
             return handleToolCall(message.id, message.params, dispatch);
         default:
@@ -189,6 +207,7 @@ export async function handleRuntimeProbeMcpMessage(
 export async function processRuntimeProbeMcpLine(
     line: string,
     dispatch: RuntimeProbeDispatch,
+    service?: RuntimeProbeServiceHandle,
 ): Promise<string | undefined> {
     if (!line.trim()) return undefined;
     let message: unknown;
@@ -201,7 +220,7 @@ export async function processRuntimeProbeMcpLine(
             `JSON parse error: ${asError(error).message}`,
         ));
     }
-    const response = await handleRuntimeProbeMcpMessage(message, dispatch);
+    const response = await handleRuntimeProbeMcpMessage(message, dispatch, service);
     return response === undefined ? undefined : JSON.stringify(response);
 }
 
@@ -221,6 +240,7 @@ export async function runRuntimeProbeMcpStdio(
             const response = await processRuntimeProbeMcpLine(
                 line,
                 command => service.dispatch(command),
+                service,
             );
             if (response !== undefined) writeOutput(`${response}\n`);
         }
@@ -240,7 +260,7 @@ export function createRuntimeProbeMcpHttpServer(
                 sendJson(response, 200, {
                     status: "ok",
                     name: COCOS_LIVE_PROBE_MCP_NAME,
-                    tools: RUNTIME_PROBE_MCP_TOOLS.length,
+                    tools: runtimeProbeMcpTools(service).length,
                 });
                 return;
             }
@@ -260,6 +280,7 @@ export function createRuntimeProbeMcpHttpServer(
                 const result = await handleRuntimeProbeMcpMessage(
                     message,
                     command => service.dispatch(command),
+                    service,
                 );
                 if (result === undefined) {
                     response.statusCode = 202;
@@ -364,6 +385,10 @@ function commandForToolCall(params: unknown): RuntimeProbeCommand {
         ? {}
         : requireRecord(record.arguments, `${name} arguments`);
     switch (name) {
+        case "game_state":
+        case "game_step":
+        case "game_autoplay":
+            return parseRuntimeProbeArgs([name.replace("_", "-"), JSON.stringify(args)]);
         case "runtime_screenshot":
             return parseRuntimeProbeArgs(["screenshot", JSON.stringify(args)]);
         case "runtime_input":

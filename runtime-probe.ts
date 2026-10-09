@@ -3,7 +3,8 @@ import { createHash, randomUUID } from "crypto";
 import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
-import { captureScreenshot, InteractionCommand, PageTransport, parseInteractionCommand, sendInput, waitForCondition } from "./runtime-interaction";
+import { captureScreenshot, deadlineTransport, InteractionCommand, observePage, PageTransport, parseInteractionCommand, sendInput, waitForCondition } from "./runtime-interaction";
+import { GameFailure, readGameBridge, RuntimeGame } from "./runtime-game";
 import { RuntimeDiagnostics } from "./runtime-diagnostics";
 import {
     buildCocosProbeExpression,
@@ -66,6 +67,7 @@ class OwnedTargetLostError extends Error {}
 class OwnedTargetMismatchError extends Error {}
 
 export type RuntimeProbeCommand =
+    | { readonly kind: "game-state" | "game-step" | "game-autoplay"; readonly args: Readonly<Record<string, unknown>> }
     | InteractionCommand
     | { readonly kind: "status" | "launch" | "refresh" }
     | {
@@ -134,6 +136,7 @@ export interface RuntimeProbeDependencies {
 }
 
 export interface RuntimeProbeServiceOptions {
+    readonly gameExtension?: string;
     readonly browserExecutable?: string;
     readonly workspaceRoot?: string;
     readonly previewUrl?: string;
@@ -151,6 +154,7 @@ export interface RuntimeProbeServiceOptions {
 }
 
 export interface RuntimeProbeServiceHandle {
+    readonly game?: RuntimeGame;
     dispatch(command: RuntimeProbeCommand): Promise<unknown>;
     dispose(): Promise<void>;
 }
@@ -162,6 +166,17 @@ export type RuntimeProbeServiceFactory = (
 export function parseRuntimeProbeArgs(argv: readonly string[]): RuntimeProbeCommand {
     const [command, ...args] = argv;
     switch (command) {
+        case "game-state":
+        case "game-step":
+        case "game-autoplay": {
+            const values = args[0] === "--file"
+                ? [fs.readFileSync(requireSingleValue(command, args.slice(1)), "utf8").replace(/^\uFEFF/, "")]
+                : args;
+            if (values.length > 1) throw new Error(`${command} accepts one JSON argument object`);
+            const options: unknown = values[0] ? JSON.parse(values[0]) : {};
+            if (!options || typeof options !== "object" || Array.isArray(options)) throw new Error("Game arguments must be an object");
+            return { kind: command, args: options as Readonly<Record<string, unknown>> };
+        }
         case "screenshot":
         case "input":
         case "wait":
@@ -290,6 +305,7 @@ function defaultSharedTargetLockPath(
 }
 
 export class RuntimeProbeService {
+    public readonly game: RuntimeGame | undefined;
     private readonly previewUrl: string;
     private readonly managedPreviewUrl: string;
     private readonly cdpOrigin: string;
@@ -324,6 +340,8 @@ export class RuntimeProbeService {
     private disposePromise: Promise<void> | undefined;
 
     public constructor(options: RuntimeProbeServiceOptions = {}) {
+        const extension = options.gameExtension ?? process.env.COCOS_RUNTIME_PROBE_GAME_EXTENSION?.trim();
+        this.game = extension ? new RuntimeGame(extension, options.workspaceRoot ?? path.resolve(__dirname, "..", "..")) : undefined;
         const workspaceDefaults = createRuntimeProbeWorkspaceDefaults(options.workspaceRoot);
         this.artifactDirectory = path.join(os.tmpdir(), `cocos-live-probe-${workspaceDefaults.identity}-artifacts`);
         this.previewUrl = options.previewUrl ?? DEFAULT_PREVIEW_URL;
@@ -370,7 +388,8 @@ export class RuntimeProbeService {
         if (!this.acceptingDispatches) {
             return Promise.reject(new Error("Runtime probe service is disposing or disposed"));
         }
-        const result = this.dispatchTail.then(() => this.dispatchCommand(command));
+        const enqueuedAt = performance.now();
+        const result = this.dispatchTail.then(() => this.dispatchCommand(command, enqueuedAt));
         this.dispatchTail = result.then(() => undefined, () => undefined);
         return result;
     }
@@ -382,8 +401,12 @@ export class RuntimeProbeService {
         return this.disposePromise;
     }
 
-    private async dispatchCommand(command: RuntimeProbeCommand): Promise<unknown> {
+    private async dispatchCommand(command: RuntimeProbeCommand, enqueuedAt = performance.now()): Promise<unknown> {
         switch (command.kind) {
+            case "game-state":
+            case "game-step":
+            case "game-autoplay":
+                return this.dispatchGame(command, enqueuedAt);
             case "diagnostics":
             case "wait":
             case "input":
@@ -413,6 +436,61 @@ export class RuntimeProbeService {
                 return command.captureDiagnostics ? this.evaluateWithDiagnostics(this.dependencies.readTextFile(command.path))
                     : this.evaluateExpression(this.dependencies.readTextFile(command.path));
         }
+    }
+
+    private async dispatchGame(command: Extract<RuntimeProbeCommand, { args: unknown }>, enqueuedAt: number): Promise<unknown> {
+        if (!this.game) throw new Error("Game extension is not configured");
+        const request = this.game.request(command.kind, command.args);
+        const deadline = enqueuedAt + request.timeoutMs;
+        this.operationDeadline = deadline;
+        let active = true;
+        try {
+            this.checkOperationDeadline();
+            if (!this.targetId) { await this.requirePreview(); await this.createOwnedTarget(true, false); }
+            let evaluator = await this.getEvaluatorForOwnedTarget();
+            if (!this.ready) evaluator = await this.waitForCocosReady(evaluator);
+            if (!evaluator.send || !evaluator.onEvent) throw new Error("Game interaction transport is unsupported");
+            const checkedPage = (operationDeadline: number) => {
+                if (!active || !this.acceptingDispatches) throw new GameFailure("stopped", "Game context is no longer active");
+                this.operationDeadline = Math.min(deadline, operationDeadline);
+                this.checkOperationDeadline();
+                return deadlineTransport(evaluator as PageTransport, this.operationDeadline);
+            };
+            const read = async (operationDeadline: number) => {
+                const page = checkedPage(operationDeadline);
+                await this.resolveOwnedTarget(Math.max(1, operationDeadline - performance.now()));
+                const identity = { targetId: this.targetId!, instanceId: this.instanceId, refreshGeneration: this.refreshGeneration };
+                const before = await observePage(page, identity);
+                const bridge = await page.evaluate(`(${readGameBridge.toString()})(${JSON.stringify(this.game!.extension.bridgeName)})`);
+                const after = await observePage(page, identity);
+                if (before.observation.documentId !== after.observation.documentId) throw new Error("Game page document changed");
+                return { observation: after.observation, bridge, cocosVersion: after.cocos.version };
+            };
+            return await this.game.execute(request, { read,
+                diagnostics: after => this.diagnostics.read({ after, limit: 50 }),
+                input: async (decision, before, operationDeadline) => {
+                    const page = checkedPage(operationDeadline);
+                    const latest = await read(operationDeadline);
+                    const bridge = latest.bridge as { instanceId?: string };
+                    if (latest.observation.documentId !== before.documentId || bridge.instanceId !== before.bridgeInstanceId) {
+                        throw new GameFailure("page-changed", "Game page or bridge changed before input");
+                    }
+                    const identity = { targetId: this.targetId!, instanceId: this.instanceId, refreshGeneration: this.refreshGeneration };
+                    const screenshot = await captureScreenshot(page, identity, this.artifactDirectory);
+                    const remaining = Math.floor(operationDeadline - performance.now());
+                    if (remaining < 100) throw new GameFailure("time-limit", "Insufficient time for input");
+                    const input = parseInteractionCommand("input", { ...decision.input, observation: screenshot.observation, timeoutMs: remaining });
+                    if (input.kind !== "input") throw new Error("Invalid game input");
+                    // sendInput owns its deadline; its release path needs the original transport after that deadline.
+                    this.operationDeadline = undefined;
+                    const result = await sendInput(evaluator as PageTransport, identity, input, async ms => {
+                        if (!active || !this.acceptingDispatches) throw new GameFailure("stopped", "Game context is no longer active");
+                        return this.resolveOwnedTarget(ms);
+                    });
+                    return { ...result, screenshotPath: screenshot.outputPath };
+                },
+            }, enqueuedAt);
+        } finally { active = false; this.operationDeadline = undefined; }
     }
 
     private async dispatchInteraction(command: InteractionCommand): Promise<unknown> {
@@ -1054,7 +1132,8 @@ export async function runRuntimeProbeCli(
 export function runtimeProbeOptionsFromEnv(
     env: NodeJS.ProcessEnv = process.env,
 ): RuntimeProbeServiceOptions {
-    const options: { previewUrl?: string; cdpOrigin?: string; browserExecutable?: string } = {};
+    const options: { previewUrl?: string; cdpOrigin?: string; browserExecutable?: string; gameExtension?: string } = {};
+    if (env.COCOS_RUNTIME_PROBE_GAME_EXTENSION?.trim()) options.gameExtension = env.COCOS_RUNTIME_PROBE_GAME_EXTENSION.trim();
     if (env.COCOS_RUNTIME_PROBE_BROWSER_EXECUTABLE?.trim()) {
         options.browserExecutable = env.COCOS_RUNTIME_PROBE_BROWSER_EXECUTABLE.trim();
     }

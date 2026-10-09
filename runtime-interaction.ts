@@ -23,7 +23,7 @@ export interface Observation extends PageIdentity {
 
 class OperationDeadlineError extends Error {}
 
-function deadlineTransport(page: PageTransport, deadline: number): PageTransport {
+export function deadlineTransport(page: PageTransport, deadline: number): PageTransport {
     const send = (method: string, params?: Readonly<Record<string, unknown>>, timeoutMs?: number) => {
         const remaining = Math.ceil(deadline - performance.now());
         if (remaining <= 0) throw new OperationDeadlineError("Operation total timeout exceeded");
@@ -385,8 +385,11 @@ export async function sendInput(page: PageTransport, identity: PageIdentity, com
         completed = true;
     } catch (error) { errorMessage = error instanceof Error ? error.message : String(error); }
     finally {
+        const cleanupDeadline = performance.now() + 3000;
         const cleanup = async (method: string, params: Record<string, unknown>) => {
-            try { await page.send(method, params, 1000); } catch { cleanupConfirmed = false; }
+            const remaining = Math.ceil(cleanupDeadline - performance.now());
+            if (remaining <= 0) { cleanupConfirmed = false; return; }
+            try { await page.send(method, params, Math.min(1000, remaining)); } catch { cleanupConfirmed = false; }
         };
         if (pointerHeld) await cleanup(command.device === "touch" ? "Input.dispatchTouchEvent" : "Input.dispatchMouseEvent",
             command.device === "touch" ? { type: completed ? "touchEnd" : "touchCancel", touchPoints: [] }
