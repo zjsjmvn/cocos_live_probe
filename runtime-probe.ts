@@ -6,6 +6,8 @@ import * as path from "path";
 import { captureScreenshot, deadlineTransport, InteractionCommand, observePage, PageTransport, parseInteractionCommand, sendInput, waitForCondition } from "./runtime-interaction";
 import { GameFailure, readGameBridge, RuntimeGame } from "./runtime-game";
 import { RuntimeDiagnostics } from "./runtime-diagnostics";
+import { EvidenceCommand, EvidenceLimits, evidenceEnabled, parseEvidence, RuntimeEvidence } from "./runtime-evidence";
+import { readRenderState, RenderCommand, renderTimeout, waitForRender } from "./runtime-render";
 import {
     buildCocosProbeExpression,
     CdpBrowserClient,
@@ -67,6 +69,8 @@ class OwnedTargetLostError extends Error {}
 class OwnedTargetMismatchError extends Error {}
 
 export type RuntimeProbeCommand =
+    | EvidenceCommand
+    | RenderCommand
     | { readonly kind: "inspector-connect"; readonly instanceId?: string }
     | { readonly kind: "inspector-disconnect" }
     | { readonly kind: "game-state" | "game-step" | "game-autoplay"; readonly args: Readonly<Record<string, unknown>> }
@@ -138,6 +142,9 @@ export interface RuntimeProbeDependencies {
 }
 
 export interface RuntimeProbeServiceOptions {
+    readonly evidence?: boolean;
+    readonly evidenceRoot?: string;
+    readonly evidenceLimits?: EvidenceLimits;
     readonly gameExtension?: string;
     readonly browserExecutable?: string;
     readonly workspaceRoot?: string;
@@ -168,6 +175,15 @@ export type RuntimeProbeServiceFactory = (
 export function parseRuntimeProbeArgs(argv: readonly string[]): RuntimeProbeCommand {
     const [command, ...args] = argv;
     switch (command) {
+        case "render-ready": {
+            if (args.length > 1) throw new Error("render-ready accepts one JSON argument");
+            const value = args[0] ? JSON.parse(args[0]) : {};
+            if (!value || typeof value !== "object" || Array.isArray(value) || Object.keys(value).some(key => key !== "timeoutMs")) throw new Error("Invalid render-ready arguments");
+            return { kind: "render-ready", timeoutMs: renderTimeout(value.timeoutMs) };
+        }
+        case "evidence":
+            if (args.length !== 1) throw new Error("evidence requires one JSON argument");
+            return parseEvidence(JSON.parse(args[0]));
         case "inspector-connect":
             if (args.length > 1) throw new Error("inspector-connect accepts one optional instance ID");
             return { kind: "inspector-connect", ...(args[0] ? { instanceId: args[0] } : {}) };
@@ -346,6 +362,8 @@ export class RuntimeProbeService {
     private inspectorServer?: import("http").Server;
     private inspectorConnection?: import("./runtime-inspector-bridge").InspectorProbeClient;
     private readonly workspaceRoot: string;
+    private readonly evidence: RuntimeEvidence;
+    private readonly autoEvidence: boolean;
     private acceptingDispatches = true;
     private disposePromise: Promise<void> | undefined;
 
@@ -369,6 +387,9 @@ export class RuntimeProbeService {
         this.instanceId = options.instanceId
             ?? options.dependencies?.randomUUID?.()
             ?? randomUUID();
+        this.autoEvidence = options.evidence ?? evidenceEnabled(process.env.COCOS_RUNTIME_PROBE_EVIDENCE);
+        this.evidence = new RuntimeEvidence(this.workspaceRoot, this.instanceId,
+            options.evidenceRoot ?? process.env.COCOS_RUNTIME_PROBE_EVIDENCE_ROOT, options.evidenceLimits);
         this.managedPreviewUrl = buildManagedPreviewUrl(this.previewUrl, this.instanceId);
         const defaultDependencyOptions: DefaultDependencyOptions = {
             cdpOrigin: this.cdpOrigin,
@@ -400,7 +421,7 @@ export class RuntimeProbeService {
             return Promise.reject(new Error("Runtime probe service is disposing or disposed"));
         }
         const enqueuedAt = performance.now();
-        const result = this.dispatchTail.then(() => this.dispatchCommand(command, enqueuedAt));
+        const result = this.dispatchTail.then(() => this.dispatchRecorded(command, enqueuedAt));
         this.dispatchTail = result.then(() => undefined, () => undefined);
         return result;
     }
@@ -410,6 +431,41 @@ export class RuntimeProbeService {
         this.acceptingDispatches = false;
         this.disposePromise = this.disposeAfterQueue();
         return this.disposePromise;
+    }
+
+    private async dispatchRecorded(command: RuntimeProbeCommand, enqueuedAt: number): Promise<unknown> {
+        if (this.inspectorConnection || command.kind.startsWith("inspector-") || command.kind === "evidence") return this.dispatchCommand(command, enqueuedAt);
+        const timeoutMs = "timeoutMs" in command ? command.timeoutMs ?? 5000 : "args" in command ? Number(command.args.timeoutMs ?? (command.kind === "game-autoplay" ? 20000 : 5000)) : 10000;
+        const deadline = enqueuedAt + timeoutMs;
+        let automatic = false;
+        let evidenceError: string | undefined;
+        if (this.autoEvidence && !this.evidence.runId) {
+            try { this.evidence.start(command.kind, this.diagnostics.read({ limit: 0 }), deadline); automatic = true; }
+            catch (error) { evidenceError = String(error); }
+        }
+        const startedAt = new Date().toISOString();
+        let result: any; let caught: unknown;
+        // Reserve a small part of the existing total budget for the bounded manifest.
+        const executionAt = this.evidence.runId ? enqueuedAt - Math.min(200, timeoutMs / 10) : enqueuedAt;
+        try { result = await this.dispatchCommand(command, executionAt); }
+        catch (error) { caught = error; }
+        let evidence: unknown;
+        if (this.evidence.runId) {
+            try { this.evidence.record(command, result, caught, startedAt, performance.now() - enqueuedAt,
+                { instanceId: this.instanceId, targetId: this.targetId ?? null, refreshGeneration: this.refreshGeneration },
+                this.diagnostics.read({ after: this.evidence.cursor, limit: 1000 }), deadline); }
+            catch (error) { evidenceError = String(error); this.evidence.problem(evidenceError); }
+            try { evidence = automatic ? this.evidence.finish(this.evidence.runId, deadline) : { runId: this.evidence.runId }; }
+            catch (error) { evidenceError = String(error); if (automatic) this.evidence.abandon(); }
+        }
+        if (caught) throw caught;
+        if (!result || typeof result !== "object" || Array.isArray(result) || !(evidence || evidenceError)) return result;
+        const augmented = { ...result, ...(evidence ? { evidence: { ...result.evidence, ...evidence as object } } : {}), ...(evidenceError ? { evidenceError } : {}) };
+        if (command.kind.startsWith("game-") && Buffer.byteLength(JSON.stringify(augmented)) > 256 * 1024) {
+            while (Array.isArray(augmented.records) && augmented.records.length && Buffer.byteLength(JSON.stringify(augmented)) > 256 * 1024) { augmented.records.shift(); augmented.truncated = true; }
+            if (Buffer.byteLength(JSON.stringify(augmented)) > 256 * 1024) for (const key of ["before", "after", "input", "decision", "goal", "diagnostics"]) augmented[key] = { omitted: true };
+        }
+        return augmented;
     }
 
     private async dispatchCommand(command: RuntimeProbeCommand, enqueuedAt = performance.now()): Promise<unknown> {
@@ -425,6 +481,14 @@ export class RuntimeProbeService {
         }
         if (this.inspectorConnection) return this.inspectorConnection.dispatch(command);
         switch (command.kind) {
+            case "render-ready": return this.dispatchRender(command, enqueuedAt);
+            case "evidence": {
+                const { kind, ...args } = command;
+                const request = parseEvidence(args);
+                const deadline = enqueuedAt + request.timeoutMs;
+                if (request.action === "start") return this.evidence.start(request.label, this.diagnostics.read({ limit: 0 }), deadline);
+                return request.action === "finish" ? this.evidence.finish(request.runId!, deadline) : this.evidence.export(request.runId!, deadline);
+            }
             case "game-state":
             case "game-step":
             case "game-autoplay":
@@ -433,7 +497,7 @@ export class RuntimeProbeService {
             case "wait":
             case "input":
             case "screenshot":
-                return this.dispatchInteraction(command);
+                return this.dispatchInteraction(command, enqueuedAt);
             case "status":
                 return this.status();
             case "open-inspector": {
@@ -500,10 +564,12 @@ export class RuntimeProbeService {
                 const bridge = await page.evaluate(`(${readGameBridge.toString()})(${JSON.stringify(this.game!.extension.bridgeName)})`);
                 const after = await observePage(page, identity);
                 if (before.observation.documentId !== after.observation.documentId) throw new Error("Game page document changed");
+                this.evidence.noteRuntime(after.cocos.version);
                 return { observation: after.observation, bridge, cocosVersion: after.cocos.version };
             };
             return await this.game.execute(request, { read,
                 diagnostics: after => this.diagnostics.read({ after, limit: 50 }),
+                recordStep: (result, step, deadline) => this.evidence.recordStep(result, step, deadline),
                 input: async (decision, before, operationDeadline) => {
                     const page = checkedPage(operationDeadline);
                     const validateBridge = (bridge: unknown) => {
@@ -541,12 +607,11 @@ export class RuntimeProbeService {
         } finally { active = false; this.operationDeadline = undefined; }
     }
 
-    private async dispatchInteraction(command: InteractionCommand): Promise<unknown> {
+    private async dispatchInteraction(command: InteractionCommand, started = performance.now()): Promise<unknown> {
         const { kind, ...args } = command;
         const validated = parseInteractionCommand(kind, args);
-        const started = performance.now();
-        const timed = validated.kind === "input" || validated.kind === "wait";
-        this.operationDeadline = timed ? started + validated.timeoutMs : undefined;
+        const timed = validated.kind === "input" || validated.kind === "wait" || validated.kind === "screenshot";
+        this.operationDeadline = timed ? started + ("timeoutMs" in validated ? validated.timeoutMs ?? 5000 : 5000) : undefined;
         const identity = () => ({ targetId: this.targetId ?? null, instanceId: this.instanceId,
             refreshGeneration: this.refreshGeneration });
         let evaluator: RuntimeProbeEvaluator;
@@ -564,6 +629,7 @@ export class RuntimeProbeService {
             if (!timed || performance.now() < this.operationDeadline!) throw error;
             return { ...identity(), capturedAt: new Date().toISOString(), elapsedMs: performance.now() - started,
                 ...(validated.kind === "wait" ? { status: "timeout", condition: validated.condition, observation: null }
+                    : validated.kind === "screenshot" ? { status: "failed", reason: "timeout", error: "Screenshot preparation timed out" }
                     : { status: "failed", located: false, started: false, completed: false, cleanupConfirmed: true,
                         error: "Input total timeout exceeded during preparation" }) };
         } finally {
@@ -574,10 +640,46 @@ export class RuntimeProbeService {
         const page = evaluator as PageTransport;
         switch (validated.kind) {
             case "diagnostics": return { ...pageIdentity, capturedAt: new Date().toISOString(), ...this.diagnostics.read(validated) };
-            case "screenshot": return captureScreenshot(page, pageIdentity, this.artifactDirectory, validated.outputPath);
+            case "screenshot": {
+                const deadline = started + (validated.timeoutMs ?? 5000);
+                let render: any;
+                try {
+                    if (validated.waitForRender) {
+                        render = await waitForRender(page, pageIdentity, deadline, ms => this.resolveOwnedTarget(ms));
+                        if (render.status !== "rendered") return { status: "failed", reason: render.status, render };
+                    }
+                    const screenshot = await captureScreenshot(deadlineTransport(page, deadline), pageIdentity, this.artifactDirectory, validated.outputPath,
+                        validated.waitForRender ? async observation => {
+                            const after = await deadlineTransport(page, deadline).evaluate(`(${readRenderState.toString()})(0,${pageIdentity.refreshGeneration})`) as any;
+                            if (after.status !== "rendered" || render.sceneId !== after.sceneId || render.observation.documentId !== observation.documentId) throw new Error("Scene changed during strict screenshot");
+                        } : undefined);
+                    if (!validated.waitForRender) {
+                        try { render = await deadlineTransport(page, deadline).evaluate(`(${readRenderState.toString()})(0,${pageIdentity.refreshGeneration})`); }
+                        catch { render = { status: "unverified", reason: "render-observation-unavailable" }; }
+                    }
+                    return { ...screenshot, render };
+                } catch (error) {
+                    return { status: "failed", reason: performance.now() >= deadline ? "timeout" : "page-changed", render, error: String(error).slice(0, 1000) };
+                }
+            }
             case "wait": return waitForCondition(page, pageIdentity, validated, remaining => this.resolveOwnedTarget(remaining), started);
             case "input": return sendInput(page, pageIdentity, validated, remaining => this.resolveOwnedTarget(remaining), started);
         }
+    }
+
+    private async dispatchRender(command: RenderCommand, started: number): Promise<unknown> {
+        const deadline = started + renderTimeout(command.timeoutMs);
+        this.operationDeadline = deadline;
+        try {
+            this.checkOperationDeadline();
+            if (!this.targetId) { await this.requirePreview(); await this.createOwnedTarget(true, false); }
+            const evaluator = await this.getEvaluatorForOwnedTarget();
+            if (!evaluator.send || !evaluator.onEvent) throw new Error("Render observation transport unsupported");
+            const identity = { instanceId: this.instanceId, targetId: this.targetId!, refreshGeneration: this.refreshGeneration };
+            return await waitForRender(evaluator as PageTransport, identity, deadline, ms => this.resolveOwnedTarget(ms));
+        } catch (error) {
+            return { status: performance.now() >= deadline ? "timeout" : "page-changed", engineReady: this.ready, error: String(error).slice(0, 1000) };
+        } finally { this.operationDeadline = undefined; }
     }
 
     private checkOperationDeadline(): void {
@@ -594,6 +696,7 @@ export class RuntimeProbeService {
             )),
         ]);
         return {
+            evidence: { activeRunId: this.evidence.runId ?? null, automatic: this.autoEvidence },
             preview: { available: previewAvailable, url: this.previewUrl },
             cdp: { available: cdpAvailable, url: this.cdpOrigin },
             browser: { version: this.browserVersion, configuredExecutable: this.browserExecutable ?? null,
@@ -1129,6 +1232,10 @@ export class RuntimeProbeService {
 
     private async disposeAfterQueue(): Promise<void> {
         await this.dispatchTail;
+        if (this.evidence.runId) {
+            try { this.evidence.finish(this.evidence.runId, performance.now() + 1000, "service-closed"); }
+            catch { /* The on-disk in-progress manifest remains an incomplete record. */ }
+        }
         this.inspectorConnection = undefined;
         if (this.inspectorServer) {
             const server = this.inspectorServer;
@@ -1137,6 +1244,9 @@ export class RuntimeProbeService {
                 server.close(error => error ? reject(error) : resolve());
                 server.closeAllConnections();
             });
+        }
+        if (this.evaluator?.send) {
+            try { await this.evaluator.send("Runtime.evaluate", { expression: "globalThis.__cocosLiveProbeRenderEvidence?.dispose?.();globalThis.__cocosLiveProbeInputDelivery?.dispose?.()", returnByValue: true }, 250); } catch { /* The owned page may already be closed. */ }
         }
         this.closeEvaluator();
         const browser = this.browserClient;
@@ -1203,7 +1313,9 @@ export async function runRuntimeProbeCli(
 export function runtimeProbeOptionsFromEnv(
     env: NodeJS.ProcessEnv = process.env,
 ): RuntimeProbeServiceOptions {
-    const options: { workspaceRoot?: string; previewUrl?: string; cdpOrigin?: string; browserExecutable?: string; gameExtension?: string } = {};
+    const options: { workspaceRoot?: string; previewUrl?: string; cdpOrigin?: string; browserExecutable?: string; gameExtension?: string; evidence?: boolean; evidenceRoot?: string } = {};
+    if (env.COCOS_RUNTIME_PROBE_EVIDENCE !== undefined) options.evidence = evidenceEnabled(env.COCOS_RUNTIME_PROBE_EVIDENCE);
+    if (env.COCOS_RUNTIME_PROBE_EVIDENCE_ROOT?.trim()) options.evidenceRoot = env.COCOS_RUNTIME_PROBE_EVIDENCE_ROOT.trim();
     if (env.COCOS_RUNTIME_PROBE_WORKSPACE_ROOT?.trim()) options.workspaceRoot = path.resolve(env.COCOS_RUNTIME_PROBE_WORKSPACE_ROOT.trim());
     if (env.COCOS_RUNTIME_PROBE_GAME_EXTENSION?.trim()) options.gameExtension = env.COCOS_RUNTIME_PROBE_GAME_EXTENSION.trim();
     if (env.COCOS_RUNTIME_PROBE_BROWSER_EXECUTABLE?.trim()) {

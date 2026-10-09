@@ -146,7 +146,7 @@ export class RuntimeDiagnostics {
         const selected = matching.slice(0, options.limit ?? 100).map(item => item.record);
         const hasMore = matching.length > selected.length;
         return { startedAt: this.startedAt, connected: this.connected, scope: "current service connection only",
-            records: selected, nextCursor: hasMore ? selected[selected.length - 1].cursor : this.cursor,
+            records: selected, nextCursor: hasMore && selected.length ? selected[selected.length - 1].cursor : this.cursor,
             oldestCursor, hasMore, cursorGap: after < oldestCursor - 1, dropped: this.dropped,
             retainedBytes: this.bytes, capacity: { entries: 1000, bytes: 2 * 1024 * 1024, entryBytes: 16 * 1024 } };
     }

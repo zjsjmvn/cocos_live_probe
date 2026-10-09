@@ -3,6 +3,7 @@ import * as fs from "fs";
 import * as path from "path";
 import { DIAGNOSTIC_LEVELS, DIAGNOSTIC_TYPES, DiagnosticsOptions } from "./runtime-diagnostics";
 import { decodeRuntimeEvaluateResponse } from "./cdp-runtime-probe-core";
+import { finishDelivery, installDelivery } from "./runtime-delivery";
 
 export interface PageTransport {
     evaluate(expression: string): Promise<unknown>;
@@ -61,6 +62,8 @@ export interface WaitCommand { kind: "wait"; condition: WaitCondition; timeoutMs
 export type InteractionCommand = InputCommand | WaitCommand | ({ kind: "diagnostics" } & DiagnosticsOptions) | {
     kind: "screenshot";
     outputPath?: string;
+    waitForRender?: boolean;
+    timeoutMs?: number;
 };
 
 export function parseInteractionCommand(kind: string, value: unknown): InteractionCommand {
@@ -82,8 +85,12 @@ export function parseInteractionCommand(kind: string, value: unknown): Interacti
         return { kind, after, limit, types: filters("types", DIAGNOSTIC_TYPES), levels: filters("levels", DIAGNOSTIC_LEVELS) };
     }
     if (kind !== "screenshot") throw new Error(`Unknown interaction command: ${kind}`);
-    checkKeys(args, ["outputPath"]);
-    return { kind, ...(args.outputPath === undefined ? {} : { outputPath: text(args.outputPath, "outputPath") }) };
+    checkKeys(args, ["outputPath", "waitForRender", "timeoutMs"]);
+    if (args.waitForRender !== undefined && typeof args.waitForRender !== "boolean") throw new Error("waitForRender must be boolean");
+    const timeout = args.timeoutMs;
+    if (timeout !== undefined && (!Number.isInteger(timeout) || Number(timeout) < 1 || Number(timeout) > 10000)) throw new Error("Screenshot timeoutMs must be 1..10000");
+    return { kind, ...(args.outputPath === undefined ? {} : { outputPath: text(args.outputPath, "outputPath") }),
+        ...(args.waitForRender === undefined ? {} : { waitForRender: args.waitForRender }), ...(timeout === undefined ? {} : { timeoutMs: Number(timeout) }) };
 }
 
 function parseWait(args: Record<string, unknown>): WaitCommand {
@@ -337,6 +344,7 @@ export async function sendInput(page: PageTransport, identity: PageIdentity, com
     let modifiers = 0;
     let errorMessage: string | undefined;
     let failureReason: string | undefined;
+    const delivery = await installDelivery(boundedPage, command, point, end, deadline);
     const send = async (method: string, params: Record<string, unknown>) => {
         const latest = await observePage(boundedPage, identity);
         if (latest.observation.documentId !== expected.documentId) throw new Error("Page changed during input");
@@ -405,9 +413,13 @@ export async function sendInput(page: PageTransport, identity: PageIdentity, com
         }
         if (touchEnabled) await cleanup("Emulation.setTouchEmulationEnabled", { enabled: false });
     }
+    const deliveryEvidence = await finishDelivery(page, identity, command, delivery, completed && cleanupConfirmed, deadline);
     return { ...identity, observation: current.observation, capturedAt: new Date().toISOString(),
         status: completed && cleanupConfirmed ? "sent" : "failed", located: Boolean(point) || command.action === "key",
         started, completed: completed && cleanupConfirmed, cleanupConfirmed, point, to: end,
+        deliveryEvidence: { ...deliveryEvidence, coordinates: { viewport: current.viewport, canvases: current.canvases,
+            devicePixelRatio: current.devicePixelRatio, visualViewport: current.visualViewport, from: point, to: end,
+            source: command.point?.uuid ? "node projection to viewport CSS pixels" : "viewport CSS pixels" } },
         ...(failureReason ? { failureReason } : {}),
         ...(errorMessage ? { error: errorMessage } : !cleanupConfirmed ? { error: "Input cleanup could not be confirmed" } : {}) };
 }
@@ -472,6 +484,7 @@ export async function observePage(page: PageTransport, identity: PageIdentity) {
 
 export async function captureScreenshot(
     page: PageTransport, identity: PageIdentity, directory: string, outputPath?: string,
+    validate?: (observation: Observation) => Promise<void>,
 ) {
     const before = await observePage(page, identity);
     const image = await page.send("Page.captureScreenshot", {
@@ -482,6 +495,7 @@ export async function captureScreenshot(
         || before.observation.geometryKey !== after.observation.geometryKey) {
         throw new Error("Page changed during screenshot; observe again");
     }
+    await validate?.(after.observation);
     const png = Buffer.from(image.data, "base64");
     if (png.length < 24 || png.subarray(0, 8).toString("hex") !== "89504e470d0a1a0a") {
         throw new Error("CDP did not return a valid PNG screenshot");

@@ -33,6 +33,7 @@ interface RuntimeProbeMcpTool {
     readonly name: string;
     readonly description: string;
     readonly inputSchema: {
+        readonly oneOf?: readonly unknown[];
         readonly type: "object";
         readonly properties: Readonly<Record<string, unknown>>;
         readonly required?: readonly string[];
@@ -58,6 +59,13 @@ interface JsonRpcResponse {
 }
 
 export const RUNTIME_PROBE_MCP_TOOLS: readonly RuntimeProbeMcpTool[] = [
+    { name: "runtime_evidence", description: "Start, finish or export a bounded evidence run in the current service. Export reads files without launching or reloading a game. One active run per shared service.",
+        inputSchema: { type: "object", properties: { action: { enum: ["start", "finish", "export"] }, label: { type: "string", maxLength: 64 },
+            runId: { type: "string", pattern: "^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$" }, timeoutMs: { type: "integer", minimum: 1, maximum: 10000, default: 5000 } },
+            required: ["action"], additionalProperties: false, oneOf: [
+            { type: "object", properties: { action: { const: "start" }, label: { type: "string", maxLength: 64 }, timeoutMs: { type: "integer", minimum: 1, maximum: 10000, default: 5000 } }, required: ["action"], additionalProperties: false },
+            { type: "object", properties: { action: { enum: ["finish", "export"] }, runId: { type: "string", pattern: "^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$" }, timeoutMs: { type: "integer", minimum: 1, maximum: 10000, default: 5000 } }, required: ["action", "runId"], additionalProperties: false },
+        ] } },
     { name: "runtime_inspector_connect", description: "Attach to the existing desktop Probe Inspector in this workspace, preserving the human's running game and bug state. Reads its identity/status; never launches, refreshes or replaces its page. All subsequent commands use that same instance until disconnect. If it closes/restarts, fail without switching to Chrome.",
         inputSchema: { type: "object", properties: { instanceId: { type: "string", minLength: 1, description: "Expected desktop instance ID copied from AI 接入; rejects a replaced window." } }, additionalProperties: false } },
     { name: "runtime_inspector_disconnect", description: "Detach this AI session from the desktop Inspector without closing, refreshing or modifying its game. Future commands return to this session's original isolated runtime.", inputSchema: emptySchema() },
@@ -99,9 +107,14 @@ export const RUNTIME_PROBE_MCP_TOOLS: readonly RuntimeProbeMcpTool[] = [
         }, additionalProperties: false },
     },
     {
+        name: "runtime_render_ready",
+        description: "Confirm the current Cocos scene completed drawing. Does not resume paused games or reload the page.",
+        inputSchema: { type: "object", properties: { timeoutMs: { type: "integer", minimum: 1, maximum: 10000, default: 5000 } }, additionalProperties: false },
+    },
+    {
         name: "runtime_screenshot",
         description: "Capture the owned viewport as a PNG image and return document/geometry credentials for input.",
-        inputSchema: { type: "object", properties: { outputPath: { type: "string", minLength: 1 } }, additionalProperties: false },
+        inputSchema: { type: "object", properties: { outputPath: { type: "string", minLength: 1 }, waitForRender: { type: "boolean", default: false }, timeoutMs: { type: "integer", minimum: 1, maximum: 10000, default: 5000 } }, additionalProperties: false },
     },
     {
         name: "runtime_status",
@@ -393,6 +406,8 @@ function commandForToolCall(params: unknown): RuntimeProbeCommand {
         ? {}
         : requireRecord(record.arguments, `${name} arguments`);
     switch (name) {
+        case "runtime_render_ready": return parseRuntimeProbeArgs(["render-ready", JSON.stringify(args)]);
+        case "runtime_evidence": return parseRuntimeProbeArgs(["evidence", JSON.stringify(args)]);
         case "runtime_inspector_connect":
             if (Object.keys(args).some(key => key !== "instanceId")) throw new Error("Unknown Inspector connect argument");
             return { kind: "inspector-connect", ...(args.instanceId === undefined ? {} : { instanceId: requireString(args.instanceId, "instanceId") }) };

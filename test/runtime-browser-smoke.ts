@@ -38,12 +38,13 @@ const installFixture = `(async () => {
     node.on(cc.Node.EventType.TOUCH_START, () => node.__probeStarts++);
     node.on(cc.Node.EventType.TOUCH_MOVE, () => node.__probeMoves++);
     cc.input.on(cc.Input.EventType.TOUCH_START, event => {
+        globalThis.__liveProbeFixture.globalTouches++;
         globalThis.__liveProbeFixture.lastTouch = { location: event.getLocation(), ui: event.getUILocation() };
     });
     const overlay = button("FixtureOverlay", new cc.Color(220, 80, 70, 255));
     overlay.addComponent(cc.BlockInputEvents); overlay.active = false; overlay.__probeCount = 0;
     overlay.on(cc.Button.EventType.CLICK, () => overlay.__probeCount++);
-    globalThis.__liveProbeFixture = { scene, root, node, overlay, cameraNode, keys: [],
+    globalThis.__liveProbeFixture = { scene, root, node, overlay, cameraNode, keys: [], globalTouches: 0,
         snapshot: () => ({ count: node.__probeCount, moves: node.__probeMoves, starts: node.__probeStarts,
             overlayCount: overlay.__probeCount, keys: globalThis.__liveProbeFixture.keys }) };
     window.addEventListener("keydown", event => globalThis.__liveProbeFixture.keys.push({ key: event.key, ctrl: event.ctrlKey, shift: event.shiftKey }), true);
@@ -62,13 +63,16 @@ async function main() {
         evidence.launch = await service.dispatch({ kind: "launch" });
         const fixture = await service.dispatch({ kind: "eval", expression: installFixture }) as any;
         evidence.fixture = fixture;
-        const screen = await dispatch("screenshot");
+        const screen = await dispatch("screenshot", { waitForRender: true });
+        assert.strictEqual(screen.render.status, "rendered");
         assert.ok(screen.imageWidth > 100 && screen.imageHeight > 100);
         assert.strictEqual(screen.cocos.scene, "LiveProbeFixture");
         assert.strictEqual(fs.readFileSync(screen.outputPath).subarray(0, 8).toString("hex"), "89504e470d0a1a0a");
         evidence.screenshot = { path: screen.outputPath, width: screen.imageWidth, height: screen.imageHeight, viewport: screen.viewport };
         const click = await dispatch("input", { action: "click", device: "mouse", point: { uuid: fixture.uuid }, observation: screen.observation });
         assert.strictEqual(click.status, "sent", JSON.stringify(click));
+        assert.strictEqual(click.deliveryEvidence.hit, "hit", JSON.stringify(click.deliveryEvidence));
+        assert.ok(click.deliveryEvidence.nodes.some((item: any) => item.uuid === fixture.uuid));
         const waited = await dispatch("wait", { condition: { type: "property", selector: fixture.uuid, path: "__probeCount", operator: "eq", value: 1 } });
         assert.strictEqual(waited.status, "satisfied", JSON.stringify(waited));
         evidence.mouse = await snapshot();
@@ -77,16 +81,27 @@ async function main() {
         assert.strictEqual((await dispatch("wait", { condition: { type: "property", selector: fixture.uuid, path: "__probeCount", operator: "eq", value: 2 } })).status, "satisfied");
         const touch = await dispatch("input", { action: "click", device: "touch", point: { uuid: fixture.uuid }, observation: screen.observation });
         assert.strictEqual(touch.status, "sent", JSON.stringify(touch));
+        assert.strictEqual(touch.deliveryEvidence.hit, "hit", JSON.stringify(touch.deliveryEvidence));
+        assert.ok(touch.deliveryEvidence.nodes.some((item: any) => item.uuid === fixture.uuid));
         assert.strictEqual((await dispatch("wait", { condition: { type: "property", selector: fixture.uuid, path: "__probeCount", operator: "eq", value: 3 } })).status, "satisfied");
         evidence.touch = await snapshot();
         await service.dispatch({ kind: "eval", expression: "globalThis.__liveProbeFixture.overlay.active = true" });
-        await dispatch("input", { action: "click", device: "mouse", point: { uuid: fixture.uuid }, observation: screen.observation });
+        const blocked = await dispatch("input", { action: "click", device: "mouse", point: { uuid: fixture.uuid }, observation: screen.observation });
+        assert.strictEqual(blocked.deliveryEvidence.hit, "hit");
+        assert.deepStrictEqual(blocked.deliveryEvidence.nodes.map((item: any) => item.uuid), [fixture.overlayUuid]);
         assert.strictEqual((await dispatch("wait", { condition: { type: "property", selector: fixture.overlayUuid, path: "__probeCount", operator: "eq", value: 1 } })).status, "satisfied");
         assert.strictEqual((await snapshot()).count, 3);
         evidence.occlusion = await snapshot();
         await service.dispatch({ kind: "eval", expression: "globalThis.__liveProbeFixture.overlay.active = false" });
+        const canvasBounds = screen.canvases[0];
+        const blank = await dispatch("input", { action: "click", device: "mouse", point: { x: canvasBounds.left + 10, y: canvasBounds.top + 10 }, observation: screen.observation });
+        assert.strictEqual(blank.deliveryEvidence.hit, "miss", JSON.stringify(blank.deliveryEvidence));
+        assert.strictEqual((await snapshot()).count, 3);
+        assert.ok(await service.dispatch({ kind: "eval", expression: "globalThis.__liveProbeFixture.globalTouches>0" }));
+        evidence.blank = blank.deliveryEvidence;
         const keyboard = await dispatch("input", { action: "key", keys: ["Control", "a"], durationMs: 20, observation: screen.observation });
         assert.strictEqual(keyboard.status, "sent");
+        assert.strictEqual(keyboard.deliveryEvidence.hit, "not-applicable");
         const keySnapshot = await snapshot();
         assert.ok(keySnapshot.keys.some((key: any) => key.key === "a" && key.ctrl), JSON.stringify(keySnapshot));
         const singleKey = await dispatch("input", { action: "key", keys: ["b"], durationMs: 0, observation: screen.observation });
@@ -115,8 +130,13 @@ async function main() {
         const drag = await dispatch("input", { action: "drag", device: "mouse", point: { uuid: fixture.uuid },
             to: { x: click.point.x + 30, y: click.point.y }, durationMs: 100, observation: screen.observation });
         assert.strictEqual(drag.status, "sent", JSON.stringify(drag));
+        assert.strictEqual(drag.deliveryEvidence.hit, "hit", JSON.stringify(drag.deliveryEvidence));
         assert.ok((await snapshot()).moves > 0);
         evidence.drag = await snapshot();
+        await service.dispatch({ kind: "eval", expression: `(async()=>{const cc=await System.import("cc");cc.director.pause();return true})()` });
+        const paused = await dispatch("render-ready");
+        assert.strictEqual(paused.status, "rendered", "a paused scene may use matching draw evidence");
+        await service.dispatch({ kind: "eval", expression: `(async()=>{const cc=await System.import("cc");cc.director.resume();return true})()` });
         await service.dispatch({ kind: "eval", expression: `console.warn("live-probe-smoke-warning");
             setTimeout(() => { throw new Error("live-probe-smoke-exception"); }, 10);
             Promise.reject(new Error("live-probe-smoke-promise"));

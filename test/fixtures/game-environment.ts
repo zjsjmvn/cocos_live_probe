@@ -1,14 +1,14 @@
 import { runInNewContext } from "vm";
 import { webcrypto } from "crypto";
-import { RuntimeProbeService } from "../../runtime-probe";
+import { RuntimeProbeService, RuntimeProbeServiceOptions } from "../../runtime-probe";
 
-export function gameEnvironment(gameExtension: string, instanceId = "game-test") {
+export function gameEnvironment(gameExtension: string, instanceId = "game-test", options: RuntimeProbeServiceOptions = {}) {
     const scene = { name: "fixture", children: [] };
     const globals = {
         crypto: webcrypto, innerWidth: 640, innerHeight: 480, devicePixelRatio: 1,
-        performance: { timeOrigin: 1000 },
+        performance: { timeOrigin: 1000 }, setTimeout, clearTimeout,
         document: { querySelectorAll: () => [], hasFocus: () => true, visibilityState: "visible" },
-        cc: { director: { getScene: () => scene }, ENGINE_VERSION: "3.8.8" },
+        cc: { director: { getScene: () => scene }, ENGINE_VERSION: "3.8.8" } as any,
         count: 0, blocked: false, pressed: false, loaderId: "loader-1", bridgeInstance: "bridge-1",
         failInput: false, inputCount: 0, replaceBridgeOnScreenshot: false, replaceBridgeOnFocus: false,
         extraState: {} as Record<string, unknown>,
@@ -20,6 +20,7 @@ export function gameEnvironment(gameExtension: string, instanceId = "game-test")
     const listeners = new Map<string, Set<(params: unknown) => void>>();
     const url = `http://127.0.0.1:7456/?autoReload=false&runtimeProbeInstance=${instanceId}`;
     const service = new RuntimeProbeService({
+        ...options,
         gameExtension, instanceId, ownership: "shared",
         dependencies: {
             checkPreview: async () => true,

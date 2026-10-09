@@ -4,6 +4,7 @@
 <body>
 <header><div><strong>Cocos Live Probe</strong><span class="badge">Inspector</span><span id="ai-activity" hidden></span></div><div class="toolbar"><button id="ai-connect" hidden title="复制当前窗口和选中节点的 AI 接入说明">AI 接入</button><button id="reload-preview" hidden>重载游戏</button><button id="refresh">刷新节点树</button><label><input id="auto" type="checkbox"> 自动同步</label><button id="pause" disabled>暂停游戏</button><button id="capture">更新画面</button><button id="devtools" hidden>开发者工具</button></div></header>
 <div id="connection">正在连接人工调试实例…</div>
+<div id="evidence-bar" class="toolbar"><button id="evidence-start">开始取证</button><button id="evidence-save">保存验收包</button><span id="evidence-state" role="status">尚未开始取证</span></div>
 <main>
 <nav id="inspector-tabs" hidden role="tablist" aria-label="调试面板"><button id="nodes-tab" role="tab" aria-selected="true" aria-controls="tree">节点树 / 属性</button><button id="devtools-tab" role="tab" aria-selected="false" aria-controls="devtools-host">开发者工具</button><button id="close-devtools" hidden title="关闭开发者工具" aria-label="关闭开发者工具">×</button></nav>
 <section id="devtools-host" hidden aria-label="游戏开发者工具"></section>

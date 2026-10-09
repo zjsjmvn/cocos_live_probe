@@ -35,6 +35,7 @@ export interface GamePort {
     read(deadline: number): Promise<{ observation: Observation; bridge: unknown; cocosVersion: string | null }>;
     input(decision: Extract<GameDecision, { kind: "input" }>, before: GameObservation, deadline: number): Promise<unknown>;
     diagnostics?(after?: number): { nextCursor: number; [key: string]: unknown };
+    recordStep?(result: unknown, step: number, deadline: number): void;
 }
 interface GameStepResult {
     status: string;
@@ -177,6 +178,7 @@ export class RuntimeGame {
                 after = result.after;
                 if (result.decision.kind === "done") steps--;
                 records.push(result);
+                port.recordStep?.(result, steps, deadline);
                 if (records.length > 50) records.shift();
                 if (result.verification.progress) lastProgress = performance.now();
                 if (result.status === "completed" || result.status === "failed" || request.kind === "game-step") {

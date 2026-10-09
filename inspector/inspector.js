@@ -3,6 +3,29 @@ const $ = id => document.getElementById(id);
 const state = { tree: null, selected: null, expanded: new Set(), snapshot: null, busy: false, dirty: false };
 const token = document.querySelector('meta[name="inspector-token"]').content;
 const desktop = window.liveProbeDesktop;
+let ownedEvidenceRun = null;
+$("evidence-start").onclick = () => work(async () => {
+    const run = await api({ action: "evidence", request: { action: "start", label: "Inspector 调试" } });
+    ownedEvidenceRun = run.runId;
+    $("evidence-state").textContent = "记录中 · " + run.runId;
+    message("已开始记录当前窗口的调试操作");
+});
+$("evidence-save").onclick = () => work(async () => {
+    const status = await api({ action: "status" });
+    let runId = status.evidence?.activeRunId;
+    let finish = Boolean(runId && runId === ownedEvidenceRun);
+    if (!runId) {
+        const run = await api({ action: "evidence", request: { action: "start", label: "Inspector 当前现场" } });
+        runId = run.runId; finish = true; ownedEvidenceRun = runId;
+    }
+    if (finish) {
+        try { await api({ action: "screenshot" }); } catch (error) { message("画面采集失败，保存已有证据：" + error.message, true); }
+    }
+    const saved = await api({ action: "evidence", request: { action: finish ? "finish" : "export", runId } });
+    if (finish) ownedEvidenceRun = null;
+    $("evidence-state").textContent = `${saved.runId} · ${saved.runState === "in-progress" ? "仍在记录" : "已结束"} · ${saved.evidenceStatus === "partial" ? "部分证据" : "证据完整"}`;
+    message("验收包：" + saved.manifestPath + (saved.missing?.length ? "；" + saved.missing.join("；") : ""));
+});
 function message(text, error = false) { $("message").textContent = text; $("message").classList.toggle("error", error); }
 async function api(payload) {
     const response = await fetch("/api", { method: "POST", headers: { "Content-Type": "application/json", "X-Inspector-Token": token }, body: JSON.stringify(payload) });

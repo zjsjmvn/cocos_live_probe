@@ -138,6 +138,9 @@ function commandArguments(command: RuntimeProbeCommand): string[] {
         case "eval": return ["eval", ...(command.captureDiagnostics ? ["--diagnostics"] : []), command.expression];
         case "eval-file": return ["eval-file", ...(command.captureDiagnostics ? ["--diagnostics"] : []), path.resolve(command.path)];
         case "game-state": case "game-step": case "game-autoplay": return [command.kind, JSON.stringify(command.args)];
+        case "render-ready": case "evidence": {
+            const { kind, ...args } = command; return [kind, JSON.stringify(args)];
+        }
         case "screenshot": case "input": case "wait": case "diagnostics": {
             const { kind, ...args } = command; return [kind, JSON.stringify(args)];
         }

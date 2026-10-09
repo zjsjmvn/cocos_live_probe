@@ -52,7 +52,10 @@ export async function runDesktopInspectorSmoke(panel: BrowserWindow, probe: Runt
     const status = await probe.dispatch({ kind: "status" }) as any;
     console.log("Desktop acceptance: game and fixture ready");
     assert.strictEqual(status.instance.target.id, String(view().webContents.id), "Panel and live game must use the exact same native WebContents");
-    const shot = await probe.dispatch({ kind: "screenshot" }) as any;
+    const shot = await probe.dispatch({ kind: "screenshot", waitForRender: true }) as any;
+    assert.strictEqual(shot.render.status, "rendered", JSON.stringify(shot));
+    await panel.webContents.executeJavaScript('document.getElementById("evidence-start").click()');
+    await waitUI('document.getElementById("evidence-state").textContent.includes("记录中")');
     const ai = new RuntimeProbeService({ workspaceRoot: bridge.workspaceRoot, dependencies: {
         spawnChrome: () => { throw new Error("AI attachment must never start Chrome"); },
         createEvaluator: () => { throw new Error("AI attachment must never create its own preview"); },
@@ -72,6 +75,8 @@ export async function runDesktopInspectorSmoke(panel: BrowserWindow, probe: Runt
         assert.strictEqual(JSON.parse(cli.stdout).uuid, fixture.uuid, "A separate CLI process reads the native game, not Chrome");
         const borrowedInput = await ai.dispatch(parseInteractionCommand("input", { action: "click", device: "mouse", point: { uuid: fixture.uuid }, observation: borrowedShot.observation })) as any;
         assert.strictEqual(borrowedInput.status, "sent");
+        assert.strictEqual(borrowedInput.deliveryEvidence.hit, "hit", JSON.stringify(borrowedInput));
+        assert.strictEqual(borrowedInput.deliveryEvidence.nodes[0].uuid, fixture.uuid);
         assert.strictEqual(await evaluate("globalThis.__desktopInspectorFixture.node.__count"), 1, "AI input reaches the same game");
         await evaluate("globalThis.__desktopInspectorFixture.node.__count=0;true");
         await ai.dispatch({ kind: "inspector-disconnect" });
@@ -79,6 +84,7 @@ export async function runDesktopInspectorSmoke(panel: BrowserWindow, probe: Runt
     assert.ok(!view().webContents.isDestroyed(), "AI disconnect/EOF does not close the human's window");
     const input = await probe.dispatch(parseInteractionCommand("input", { action: "click", device: "mouse", point: { uuid: fixture.uuid }, observation: shot.observation })) as any;
     assert.strictEqual(input.status, "sent", JSON.stringify(input));
+    assert.strictEqual(input.deliveryEvidence.hit, "hit", JSON.stringify(input));
     assert.strictEqual(await evaluate("globalThis.__desktopInspectorFixture.node.__count"), 1);
     view().webContents.sendInputEvent({ type: "mouseDown", x: Math.round(input.point.x), y: Math.round(input.point.y), button: "left", clickCount: 1 });
     view().webContents.sendInputEvent({ type: "mouseUp", x: Math.round(input.point.x), y: Math.round(input.point.y), button: "left", clickCount: 1 });
@@ -101,6 +107,16 @@ export async function runDesktopInspectorSmoke(panel: BrowserWindow, probe: Runt
     await panel.webContents.executeJavaScript('document.getElementById("pause").click()');
     await waitUI('document.getElementById("pause").textContent==="继续游戏"');
     assert.strictEqual(await evaluate('(async()=>(await System.import("cc")).director.isPaused())()'), true);
+    assert.strictEqual((await probe.dispatch({ kind: "render-ready", timeoutMs: 200 }) as any).status, "rendered");
+    await waitUI('!document.getElementById("evidence-save").disabled');
+    await panel.webContents.executeJavaScript('document.getElementById("evidence-save").click()');
+    await waitUI('document.getElementById("evidence-state").textContent.includes("已结束")');
+    const savedPath = await panel.webContents.executeJavaScript('document.getElementById("message").textContent.slice("验收包：".length).split("；")[0]');
+    const savedManifest = JSON.parse(fs.readFileSync(savedPath, "utf8"));
+    assert.strictEqual(savedManifest.runState, "finished");
+    assert.ok(savedManifest.commands.some((command: any) => command.kind === "input"));
+    assert.strictEqual(await evaluate('(async()=>(await System.import("cc")).director.isPaused())()'), true, "export preserves the paused human scene");
+    assert.strictEqual((await probe.dispatch({ kind: "screenshot" }) as any).observation.documentId, shot.observation.documentId);
     const tree = await inspect({ action: "tree" });
     const before = await inspect({ action: "inspect", uuid: fixture.uuid, context: tree.context });
     const moved = await inspect({ action: "move", uuid: fixture.uuid, context: tree.context, parentUuid: fixture.parentUuid, siblingIndex: 0, keepWorldTransform: true });

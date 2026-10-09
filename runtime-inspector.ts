@@ -3,7 +3,7 @@ import * as fs from "fs";
 import * as path from "path";
 import { randomBytes } from "crypto";
 import { buildInspectorExpression, parseInspectorRequest } from "./runtime-inspector-core";
-import { RuntimeProbeService, RuntimeProbeServiceHandle, runtimeProbeOptionsFromEnv } from "./runtime-probe";
+import { RuntimeProbeService, RuntimeProbeServiceHandle, runtimeProbeOptionsFromEnv, parseRuntimeProbeArgs } from "./runtime-probe";
 
 export function createRuntimeInspectorServer(service: RuntimeProbeServiceHandle): http.Server {
     const token = randomBytes(32).toString("hex");
@@ -50,6 +50,8 @@ export function createRuntimeInspectorServer(service: RuntimeProbeServiceHandle)
             let result: unknown;
             if (payload.action === "status" && Object.keys(payload).length === 1) {
                 result = await service.dispatch({ kind: "status" });
+            } else if (payload.action === "evidence" && Object.keys(payload).every(key => ["action", "request"].includes(key))) {
+                result = await service.dispatch(parseRuntimeProbeArgs(["evidence", JSON.stringify(payload.request)]));
             } else if (payload.action === "screenshot" && Object.keys(payload).length === 1) {
                 const shot = await service.dispatch({ kind: "screenshot" }) as { outputPath: string };
                 result = { ...shot, image: `data:image/png;base64,${fs.readFileSync(shot.outputPath).toString("base64")}` };

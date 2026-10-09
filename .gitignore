@@ -2,3 +2,4 @@ node_modules/
 .tmp/
 dist-desktop/
 releases/
+.runtime-probe-evidence/

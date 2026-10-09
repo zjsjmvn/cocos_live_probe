@@ -401,6 +401,69 @@ CLI、stdio MCP 和 HTTP MCP 均支持 `COCOS_RUNTIME_PROBE_PREVIEW_URL` 与 `CO
 6. 修改脚本并确认 Creator 已完成资源编译后，只由需要新内容的对话调用自己的 `runtime_refresh`。正在采样或执行任务的其他对话不要刷新；不要用 Creator 全局广播代替定向刷新。
 7. 编辑器问题交给 `cocos_creator`，运行时画面、动画和节点问题交给 `cocos_live_probe`，需要时用 UUID 对齐两侧对象。
 
+## 验收包、输入命中与渲染确认
+
+三个能力都使用当前服务拥有的页面。CLI、stdio/HTTP MCP 和桌面 AI 接入使用相同契约，导出不会重载或恢复游戏。
+
+### 开始和保存一轮取证
+
+长期 MCP 会话使用 `runtime_evidence`：
+
+```json
+{"action":"start","label":"升级按钮点不动"}
+{"action":"finish","runId":"start 返回的准确 UUID"}
+{"action":"export","runId":"已保存运行的准确 UUID"}
+```
+
+`start` 后的外部命令加入同一运行。一个底层服务最多有一轮活动取证；`status.evidence.activeRunId` 显示当前运行。共享 HTTP 和同一个 Inspector 的调用者共享该运行。`finish` 按正常队列等待当前命令结束；`export` 可读取活动运行的快照或已落盘的旧运行，无需连接旧页面。
+
+Inspector 提供「开始取证」和「保存验收包」。直接保存会采集当前画面并结束新运行；由该面板开始的运行也由该面板结束。若另一调用者已经开始取证，保存只导出当前快照，并显示「仍在记录」。暂停时使用普通截图，不推进游戏。
+
+普通 CLI 每次调用退出，连续几个 CLI 进程不能拼接一轮内存运行。需要单次命令自动归档时，在 PowerShell 设置：
+
+```powershell
+$env:COCOS_RUNTIME_PROBE_EVIDENCE = 'on'
+npm run runtime:probe -- screenshot '{"waitForRender":true}'
+$env:COCOS_RUNTIME_PROBE_EVIDENCE = 'off'
+```
+
+默认 `off`，非法开关值报错。服务配置 `evidence` 优先于环境变量。证据目录默认为宿主工作区的 `.runtime-probe-evidence`，可通过受信任的 `evidenceRoot` 或 `COCOS_RUNTIME_PROBE_EVIDENCE_ROOT` 配置；相对路径按 `workspaceRoot` 解析。MCP 请求不能指定写入目录。源码目录和宿主均忽略默认产物目录。
+
+回执给出 `runId`、`directory`、`manifestPath`、`runState` 和 `evidenceStatus`。清单与产物在同一目录，截图有独立副本，包内图片引用为相对文件名，整个目录可一起移动。自动归档保留原命令结果；任意 eval 返回的数组或基本类型保持原形状，可从显式运行的清单查看归档。归档失败不会重放输入。
+
+`finished` 只表示取证正常结束；业务成功看 `goalReached` / `verification`。`partial` 和 `missing` 表示截图、日志、容量或预算方面的缺失。正常服务退出结束自身运行并记录 `service-closed`；异常进程退出遗留的运行在导出时标为 `incomplete`。源码 Git 提交和 dirty 是背景信息，`provesLoadedCode:false` 表示它不证明预览加载了该提交；实际引擎版本另记，未知值如实保留。
+
+每轮默认 32 MiB、1000 条命令、1000 条诊断，最多 20 轮、总计 256 MiB。可通过有界 `evidenceLimits` 调整。容量按落盘字节计算，清单和 JSON 产物最多 256 KiB；游戏回执继续最多 256 KiB、最近 50 步、状态最多 64 KiB。较早游戏步骤及时外置归档，受相同容量限制；缺失或截断有明确标记。新运行使用受管根目录锁和空间预留，保留策略只清理归属可核实且已结束的包；带人工附加文件、损坏包及活动包保留，容量不足时明确失败。
+
+只记录探针发起的输入、已取得的游戏快照和该服务连接范围内的诊断，不能恢复连接前日志或录制全部人工操作。每个归档外部命令和游戏子步骤关联 commandId；输入命中反馈原样保存。取证从原总预算中预留最多 200 ms 用于归档，控制命令默认 5 秒、最大 10 秒。预算不足省略补充产物并标记，不追加游戏操作。
+
+### 输入发送、UI 命中与业务验证
+
+原来的输入 `status`、`started`、`completed`、`cleanupConfirmed` 保持含义。新增 `deliveryEvidence`，含 actionId、设备、文档凭据、实际事件阶段、目标 UUID/路径和坐标信息：
+
+| hit 值 | 含义 |
+| --- | --- |
+| `hit` | 完整观察到实际 Cocos UI 事件目标 |
+| `miss` | 真实输入和事件处理边界完整，未观察到 UI 目标 |
+| `unknown` | 输入、关联、观察窗口或容量不完整，保留已观察事实 |
+| `unsupported` | 引擎不支持公开事件分发观察；原输入继续可用 |
+| `not-applicable` | 键盘输入，不适用 UI 指针命中 |
+
+反馈透明观察公开 `Node.dispatchEvent`，不为节点增加触摸监听，不阻止传播。目标按 UUID 去重，递归分发不会重复统计；派生鼠标/触摸阶段保留实际事件路线。最多 32 个目标、128 条事件，超限为 unknown/partial。真实 DOM 输入对应设备/坐标，释放后必须经过 Cocos after-draw 处理边界，才允许认定完整；传输回执本身不能证明 miss。
+
+坐标包含视口 CSS 像素、DPR、visualViewport、canvas 的显示/缓冲尺寸，以及引擎事件坐标。截图像素换算使用同一截图回执的 `imageWidth/imageHeight` 与视口尺寸，不把图片像素直接当作 CSS 像素。`sent` 表示发送和释放完成，`hit` 表示收到 UI 事件，购买、领奖和阶段变化仍看游戏 `verify`。全局输入玩法可能在 miss 后正常推进。
+
+### 等待当前场景绘制
+
+```powershell
+npm run runtime:probe -- render-ready '{"timeoutMs":5000}'
+npm run runtime:probe -- screenshot '{"waitForRender":true,"timeoutMs":5000}'
+```
+
+MCP 对应 `runtime_render_ready` 与 `runtime_screenshot`。渲染结果为 `rendered`、`timeout`、`paused-unverified`、`unsupported` 或 `page-changed`，普通截图也可能附 `unverified`。场景存在的 engineReady 与绘制确认分别表达。只用当前场景的公开 Director after-draw 通知确认；帧号注明来源，晚接入不冒充启动首帧。
+
+绘制凭据绑定文档、刷新代数和场景实例，场景启动使旧凭据失效。同一场景已有绘制证据时允许暂停后使用；无匹配证据则返回 paused-unverified。严格截图的等待和采集共享从入队计算的总预算，并在保存前再次核对身份；失败不会保存假称已渲染的截图。普通截图仍用于检查暂停现场。
+
 ## 安全边界
 
 - 预览 URL、CDP、HTTP MCP 都固定在 `127.0.0.1`，不要改成局域网或公网监听。
