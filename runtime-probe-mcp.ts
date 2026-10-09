@@ -58,6 +58,14 @@ interface JsonRpcResponse {
 }
 
 export const RUNTIME_PROBE_MCP_TOOLS: readonly RuntimeProbeMcpTool[] = [
+    { name: "runtime_inspector_connect", description: "Attach to the existing desktop Probe Inspector in this workspace, preserving the human's running game and bug state. Reads its identity/status; never launches, refreshes or replaces its page. All subsequent commands use that same instance until disconnect. If it closes/restarts, fail without switching to Chrome.",
+        inputSchema: { type: "object", properties: { instanceId: { type: "string", minLength: 1, description: "Expected desktop instance ID copied from AI 接入; rejects a replaced window." } }, additionalProperties: false } },
+    { name: "runtime_inspector_disconnect", description: "Detach this AI session from the desktop Inspector without closing, refreshing or modifying its game. Future commands return to this session's original isolated runtime.", inputSchema: emptySchema() },
+    {
+        name: "runtime_open_inspector",
+        description: "Show the Inspector for this session's exact preview. When attached via runtime_inspector_connect, focus the existing desktop window. Otherwise return a localhost browser panel URL; human runtime edits share this session's queue and are temporary, and the browser panel closes when this service exits.",
+        inputSchema: emptySchema(),
+    },
     {
         name: "runtime_input",
         description: "Send real mouse/touch click, long-press, drag or keyboard input to the owned page. Requires current screenshot credentials. Sent input does not prove gameplay success; partial input is never retried.",
@@ -385,6 +393,14 @@ function commandForToolCall(params: unknown): RuntimeProbeCommand {
         ? {}
         : requireRecord(record.arguments, `${name} arguments`);
     switch (name) {
+        case "runtime_inspector_connect":
+            if (Object.keys(args).some(key => key !== "instanceId")) throw new Error("Unknown Inspector connect argument");
+            return { kind: "inspector-connect", ...(args.instanceId === undefined ? {} : { instanceId: requireString(args.instanceId, "instanceId") }) };
+        case "runtime_inspector_disconnect":
+            requireEmptyArguments(name, args); return { kind: "inspector-disconnect" };
+        case "runtime_open_inspector":
+            requireEmptyArguments(name, args);
+            return { kind: "open-inspector" };
         case "game_state":
         case "game_step":
         case "game_autoplay":

@@ -1,0 +1,16 @@
+<!doctype html>
+<html lang="zh-CN">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="inspector-token" content="__INSPECTOR_TOKEN__"><title>Cocos Live Probe · Inspector</title><link rel="stylesheet" href="/inspector.css"><script src="/inspector.js" defer></script></head>
+<body>
+<header><div><strong>Cocos Live Probe</strong><span class="badge">Inspector</span><span id="ai-activity" hidden></span></div><div class="toolbar"><button id="ai-connect" hidden title="复制当前窗口和选中节点的 AI 接入说明">AI 接入</button><button id="reload-preview" hidden>重载游戏</button><button id="refresh">刷新节点树</button><label><input id="auto" type="checkbox"> 自动同步</label><button id="pause" disabled>暂停游戏</button><button id="capture">更新画面</button><button id="devtools" hidden>开发者工具</button></div></header>
+<div id="connection">正在连接人工调试实例…</div>
+<main>
+<nav id="inspector-tabs" hidden role="tablist" aria-label="调试面板"><button id="nodes-tab" role="tab" aria-selected="true" aria-controls="tree">节点树 / 属性</button><button id="devtools-tab" role="tab" aria-selected="false" aria-controls="devtools-host">开发者工具</button><button id="close-devtools" hidden title="关闭开发者工具" aria-label="关闭开发者工具">×</button></nav>
+<section id="devtools-host" hidden aria-label="游戏开发者工具"></section>
+<section class="hierarchy"><div class="section-title">节点树 <span id="count"></span></div><input id="search" type="search" placeholder="搜索节点名称、路径或 UUID" aria-label="搜索节点"><label class="filter"><input id="inactive" type="checkbox" checked> 显示未激活节点</label><div id="tree" role="tree" aria-label="场景节点树"></div></section>
+<section class="preview"><div class="section-title">运行画面 <span id="scene"></span></div><div class="canvas"><img id="shot" alt="运行中预览的最新截图" hidden><p id="shot-hint">点击「更新画面」查看当前预览。<br>游戏操作在探针的 Chrome 预览窗口中进行。</p></div><p class="hint">调整即时生效，仅保存在运行内存中；重新加载预览后恢复。<br>动态脚本、动画与 Layout 可能在下一帧覆盖手工设置。</p></section>
+<section class="properties"><div class="section-title">属性检查器 <button id="deselect">返回节点树</button></div><div id="details"><p class="empty">选择节点以查看和调整属性</p></div></section>
+</main>
+<div id="splitter" hidden role="separator" aria-label="调整预览和节点面板宽度" aria-orientation="vertical" tabindex="0"></div>
+<footer id="message" role="status" aria-live="polite">等待节点树</footer>
+</body></html>

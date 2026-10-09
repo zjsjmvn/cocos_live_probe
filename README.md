@@ -1,6 +1,6 @@
 # Cocos Live Probe（Cocos 实时探针）
 
-Cocos Live Probe 用于直接读取运行中的 Cocos Creator 浏览器预览。它让 AI 或开发者通过结构化命令获得场景节点、Transform、组件、蒙皮模型、动画状态、骨骼和渲染范围，不再需要在浏览器控制台执行脚本后手工复制数据。
+Cocos Live Probe 用于直接读取运行中的 Cocos Creator 浏览器预览。它让 AI 或开发者通过结构化命令获得场景节点、Transform、组件、蒙皮模型、动画状态、骨骼和渲染范围，不再需要在浏览器控制台执行脚本后手工复制数据。人工调试还可以使用独立桌面程序，在同一窗口中操作实时游戏、查看节点树并修改运行时属性。
 
 ## 工作方式
 
@@ -15,7 +15,7 @@ CLI manual-cli / HTTP MCP 单实例 ---------> 各自的受管页面
 
 工具会启动或复用一个独立 Chrome profile。每个 stdio MCP 对话创建自己的 BrowserContext 和 page target，并用 target ID、BrowserContext ID 和完整 URL 校验所有后续操作，不会按 origin 接管其他页面。受管 URL 带有 `autoReload=false`，因此 Creator 的 `browser:reload`、`browser:close` 和 `browser:disconnect` 广播不会刷新或关闭这些页面。
 
-刷新是显式的会话级操作。只有修改代码且确实需要载入新内容的对话才调用 `runtime_refresh`；它只刷新调用者自己的 target，并与该对话正在执行的采样或读取串行。其他正在执行任务的对话保持原页面和运行状态。
+刷新是显式的操作。只有修改代码且确实需要载入新内容时才调用 `runtime_refresh`；默认只刷新调用者自己的 target。通过 `runtime_inspector_connect` 接入桌面窗口后，刷新作用于人和 AI 共用的桌面游戏。刷新与当前实例的采样或读取串行，其他实例保持原页面和运行状态。
 
 各页面仍从同一个 `127.0.0.1:7456` 读取资源。BrowserContext 隔离运行时内存、Storage 和页面生命周期，但不提供资源版本快照；刷新后的页面会读取当前资源，未刷新的页面若随后懒加载资源，也可能读取到资源服务上的新版本。
 
@@ -28,7 +28,7 @@ CLI manual-cli / HTTP MCP 单实例 ---------> 各自的受管页面
 
 - Cocos Creator 已打开宿主项目，并已启动目标场景的浏览器预览。
 - 预览地址可通过 `http://127.0.0.1:7456/` 访问。
-- 已安装 Node.js 22 或更新版本，并在本工具目录执行过 `npm ci`。
+- 从源码运行/构建时已安装 Node.js 22.12 或更新版本，并在本工具目录执行过 `npm ci`；打包的桌面 exe 无需 Node.js。
 - Windows 上已安装 Google Chrome 或 Chromium。可设置 `COCOS_RUNTIME_PROBE_BROWSER_EXECUTABLE` 指定可执行文件；未设置时从常见用户/Program Files 路径查找 Chrome。
 - 本地端口 `9222` 用于 CDP；启用 HTTP MCP 时还需要端口 `3001`。
 
@@ -72,6 +72,84 @@ npm run runtime:probe -- sample-animation "<active-player-node-uuid>" --duration
 `scene-tree`、`find`、`node`、`animations` 和 `sample-animation` 会在需要时自动执行 `launch`。显式运行 `launch` 的价值是提前确认 Chrome、CDP 和当前实例拥有的 target 都正常。CLI 使用固定的 `manual-cli` 单实例；不同 CLI 进程会复用这个实例，不会创建每命令一个隔离页面。
 
 `status` 中的 `instance.target`、`ready` 和 `scene` 是本服务缓存的最近状态，不是一次隐式 target 恢复或页面接管。精确 target ID、BrowserContext ID 和 URL 会在结构化读取、`launch` 与 `refresh` 时重新校验；仅调用 `status` 不代表 target 此刻仍然存活。
+
+## 人工可视化调试面板
+
+默认启动独立 Electron 桌面程序，内置 Chromium，布局参考 CocosInspector：**左侧实时游戏预览，右侧节点树；选中节点后在右侧下方显示属性**。游戏可以直接使用鼠标和键盘操作，不需要另开浏览器、输入网址或安装 Creator 扩展。分隔线可以拖动调整左右宽度，也支持左右方向键。
+
+在工具目录启动：
+
+```powershell
+npm run runtime:probe:inspector
+```
+
+也可以双击 `Start Inspector.cmd`。关闭窗口会停止桌面服务并释放自己的游戏页面，不影响 Chrome 中的 CLI/MCP 页面。前提是 Creator 浏览器预览已经运行；预览地址继续使用 `COCOS_RUNTIME_PROBE_PREVIEW_URL`，默认 `http://127.0.0.1:7456/`。桌面程序使用自己的 Electron Session 和原生调试连接，不需要 Chrome 或 CDP 端口。
+
+生成可以直接双击的 Windows 程序：
+
+```powershell
+npm run package:inspector
+```
+
+产物是 `releases/Cocos Live Probe Inspector-win32-x64/Cocos Live Probe Inspector.exe`。运行时须保留同目录的资源和 DLL；运行打包程序无需安装 Node.js。构建产物和开发编译目录不提交到 Git。将打包目录移出项目后，可用 `COCOS_RUNTIME_PROBE_WORKSPACE_ROOT` 明确指定宿主项目目录。
+
+工具栏提供重载当前游戏、刷新节点树、暂停/继续游戏和游戏开发者工具；自动同步默认开启。「重载游戏」只刷新这个桌面实例。右侧通过「节点树 / 属性」和「开发者工具」标签切换；开发者工具嵌入当前窗口，提供 Chromium 的控制台、元素、源码、网络和应用/存储面板，检查的仍是左侧游戏。切换标签保留选中节点和已打开的开发者工具，分隔线与窗口缩放同时调整两个面板。
+
+浏览器面板仍可用作轻量入口：
+
+```powershell
+npm run runtime:probe:inspector:web
+```
+
+浏览器版本打开 [http://127.0.0.1:3002/](http://127.0.0.1:3002/)，用 `-- --port 3003` 更换面板端口。它使用专用 Chrome 和截图预览，游戏操作在该 Chrome 预览窗口完成。
+
+面板支持：
+
+- 完整节点树的展开/折叠、名称/路径/UUID 搜索、未激活节点显示，以及每秒自动同步。树遍历不受 CLI 的 12 层深度限制；超过 20000 个节点会明确报错。
+- 用 UUID 选择唯一节点，查看路径、激活状态、局部/世界 Transform 和组件。
+- 修改名称、active、位置、欧拉角、缩放，以及 UITransform 尺寸与锚点。
+- 查看 Cocos 组件声明的公开序列化字段；修改可写的数值、字符串、布尔值和 enabled。对象、数组、资源/节点引用与只读属性仅显示摘要。
+- 改变父节点、修改从 0 开始的同级顺序，默认保留世界 Transform；禁止场景根节点移动和父子循环。
+- 暂停/继续引擎更新与刷新节点树。桌面版直接显示实时游戏，浏览器版提供更新预览截图。
+
+所有「应用」都即时修改运行中内存，不写入源码、scene、prefab 或资源文件。动画、Layout 和游戏脚本可能在下一帧覆盖手工设置；需要时先暂停游戏。组件 setter 或激活回调仍会正常执行，失败不保证自动回滚。手工输入尚未应用时，自动同步保留该节点的草稿；主动重新选择节点会丢弃草稿。刷新节点树不重载游戏页面。
+
+桌面版有自己的隔离运行实例，节点树和属性修改都对应左侧那一个游戏页面；AI 可以显式接入这个实例，方法见下文。浏览器版与普通 CLI 共用 `manual-cli` target；同一面板服务内的请求串行执行，多个普通 CLI 进程不共享该服务的队列。若要查看 AI 当前会话正在调试的实例，可调用 `runtime_open_inspector`：已接入桌面时显示原有窗口，其他情况下返回该会话的浏览器面板 `url`。浏览器面板与调用会话共用命令队列，在会话服务退出时关闭。长时间采样或等待会使面板请求排队。
+
+面板仅监听 `127.0.0.1`，接口校验本地 Host/Origin 和面板会话令牌，不提供任意 JavaScript 执行入口。刷新预览、页面重建或场景切换后，旧的属性与层级编辑凭据失效，需刷新节点树重新选择。
+
+### 遇到 bug 时让 AI 接入当前窗口
+
+1. 在桌面 Inspector 中复现问题，需要固定引擎更新状态时点击「暂停游戏」，也可以选中疑似出错节点。
+2. 点击工具栏「AI 接入」，将复制的接入说明与 bug 描述一起粘贴到 AI 对话。说明包含当前项目、窗口实例 ID 和选中节点 UUID；按钮只复制文本。
+3. AI 调用 `runtime_inspector_connect`，传入说明中的 `instanceId`，然后使用现有的节点、动画、截图、诊断日志、真实鼠标/键盘输入及等待工具检查同一份游戏现场。连接只验证身份并读取状态，不重载游戏。
+4. 检查结束可调用 `runtime_inspector_disconnect`；AI 进程退出也不会关闭人工窗口。显式断开后，MCP 命令回到该会话原有的独立实例。
+
+当前 MCP 未加载新增工具时，AI 可在本工具目录使用 CLI：
+
+```powershell
+npm run --silent runtime:probe -- --inspector --instance-id "<复制的窗口实例ID>" status
+npm run --silent runtime:probe -- --inspector --instance-id "<复制的窗口实例ID>" scene-tree --max-depth 6 --include-inactive
+npm run --silent runtime:probe -- --inspector --instance-id "<复制的窗口实例ID>" node "<节点UUID>"
+npm run --silent runtime:probe -- --inspector --instance-id "<复制的窗口实例ID>" diagnostics
+```
+
+每次 CLI 调用都带 `--inspector --instance-id`，让不同进程访问同一个桌面服务。AI 命令与人工面板查询/编辑共用队列；游戏本身和直接人工输入仍会运行，暂停引擎也不会冻结所有浏览器异步任务。人工或 AI 的操作都可能改变共享现场，`runtime_refresh` / `refresh` 会明确重载这个游戏。
+
+接入使用按项目发现的本地端口和随机会话令牌，并固定窗口实例 ID。窗口关闭、重启或连接失效后会报错，不重试输入、不自动刷新、不切换到 Chrome；核对窗口后需显式重新连接。AI 可读取桌面调试连接期间保留的日志，日志受原有缓冲上限限制。高级 CLI `eval/eval-file` 也能通过此认证接口执行诊断脚本；MCP 和人工面板仍不暴露通用脚本执行入口。
+
+浏览器版如果默认 CDP 端口 9222 已被其他应用占用，首次启动前设置空闲端口；已有专用探针浏览器时，使用它正在监听的端口。CLI/MCP 连接同一浏览器时也应使用该值（当前项目的专用浏览器使用 9334）：
+
+```powershell
+$env:COCOS_RUNTIME_PROBE_CDP_ORIGIN = 'http://127.0.0.1:9334'
+npm run runtime:probe:inspector:web
+```
+
+`npm test` 包含面板协议、属性写入、层级、旧场景拒绝及 AI 接入身份/断线测试。`npm run test:inspector:desktop` 在真实 Electron/Cocos 中验证窗口、原生鼠标/键盘输入、属性修改、重设父节点、窗口缩放、暂停、诊断和定向重载。开发者工具验收确认嵌入同一窗口、实际控制台读取同一游戏、标签切换保留节点选择、调整宽度同步原生视图及关闭后的日志恢复；还验证 MCP 与跨进程 CLI 接入同一 target、连接保留文档、AI 输入作用于原有游戏、断开保留窗口。测试使用自己的隔离 Session 和发现记录，结束后关闭测试窗口。
+
+打包后用 `npm run test:inspector:packaged` 对实际 Windows exe 执行相同验收，确认 ASAR 中的页面、preload 和运行依赖都可用。
+
+浏览器界面验收使用 `npm run test:inspector:browser`，默认使用独立 CDP 端口 9233；可用 `COCOS_RUNTIME_PROBE_INSPECTOR_TEST_CDP_ORIGIN` 更换测试浏览器端口。两种验收均要求 Creator 预览正在运行，不修改其他会话页面。
 
 ## 项目级游戏扩展
 
@@ -158,6 +236,9 @@ stdio MCP 暴露以下工具：
 
 | MCP 工具 | 对应 CLI |
 | --- | --- |
+| `runtime_inspector_connect` | `--inspector --instance-id "<ID>" <command>`（接入当前桌面窗口） |
+| `runtime_inspector_disconnect` | CLI 每次执行后自动释放借用连接，保留窗口；MCP 显式断开 |
+| `runtime_open_inspector` | 接入桌面时显示原窗口；其他情况返回调用会话的浏览器面板 |
 | `runtime_status` | `status` |
 | `runtime_launch` | `launch` |
 | `runtime_refresh` | `refresh` |

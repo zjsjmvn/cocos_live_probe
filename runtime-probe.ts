@@ -67,9 +67,11 @@ class OwnedTargetLostError extends Error {}
 class OwnedTargetMismatchError extends Error {}
 
 export type RuntimeProbeCommand =
+    | { readonly kind: "inspector-connect"; readonly instanceId?: string }
+    | { readonly kind: "inspector-disconnect" }
     | { readonly kind: "game-state" | "game-step" | "game-autoplay"; readonly args: Readonly<Record<string, unknown>> }
     | InteractionCommand
-    | { readonly kind: "status" | "launch" | "refresh" }
+    | { readonly kind: "status" | "launch" | "refresh" | "open-inspector" }
     | {
         readonly kind: "scene-tree";
         readonly maxDepth: number;
@@ -166,6 +168,11 @@ export type RuntimeProbeServiceFactory = (
 export function parseRuntimeProbeArgs(argv: readonly string[]): RuntimeProbeCommand {
     const [command, ...args] = argv;
     switch (command) {
+        case "inspector-connect":
+            if (args.length > 1) throw new Error("inspector-connect accepts one optional instance ID");
+            return { kind: "inspector-connect", ...(args[0] ? { instanceId: args[0] } : {}) };
+        case "inspector-disconnect":
+            requireNoArgs(command, args); return { kind: "inspector-disconnect" };
         case "game-state":
         case "game-step":
         case "game-autoplay": {
@@ -336,10 +343,14 @@ export class RuntimeProbeService {
     private ready = false;
     private scene: string | null = null;
     private dispatchTail: Promise<void> = Promise.resolve();
+    private inspectorServer?: import("http").Server;
+    private inspectorConnection?: import("./runtime-inspector-bridge").InspectorProbeClient;
+    private readonly workspaceRoot: string;
     private acceptingDispatches = true;
     private disposePromise: Promise<void> | undefined;
 
     public constructor(options: RuntimeProbeServiceOptions = {}) {
+        this.workspaceRoot = options.workspaceRoot ?? path.resolve(__dirname, "../..");
         const extension = options.gameExtension ?? process.env.COCOS_RUNTIME_PROBE_GAME_EXTENSION?.trim();
         this.game = extension ? new RuntimeGame(extension, options.workspaceRoot ?? path.resolve(__dirname, "..", "..")) : undefined;
         const workspaceDefaults = createRuntimeProbeWorkspaceDefaults(options.workspaceRoot);
@@ -402,6 +413,17 @@ export class RuntimeProbeService {
     }
 
     private async dispatchCommand(command: RuntimeProbeCommand, enqueuedAt = performance.now()): Promise<unknown> {
+        if (command.kind === "inspector-connect") {
+            const { InspectorProbeClient } = await import("./runtime-inspector-bridge");
+            const client = await InspectorProbeClient.connect(this.workspaceRoot, command.instanceId);
+            const status = await client.dispatch({ kind: "status" });
+            this.inspectorConnection = client; return status;
+        }
+        if (command.kind === "inspector-disconnect") {
+            this.inspectorConnection = undefined;
+            return { connected: false, mode: "session", message: "已断开 AI 接入；Inspector 窗口和游戏现场保持运行。后续命令返回此会话原有实例。" };
+        }
+        if (this.inspectorConnection) return this.inspectorConnection.dispatch(command);
         switch (command.kind) {
             case "game-state":
             case "game-step":
@@ -414,6 +436,20 @@ export class RuntimeProbeService {
                 return this.dispatchInteraction(command);
             case "status":
                 return this.status();
+            case "open-inspector": {
+                if (!this.inspectorServer) {
+                    const { createRuntimeInspectorServer } = await import("./runtime-inspector");
+                    const server = createRuntimeInspectorServer(this);
+                    await new Promise<void>((resolve, reject) => {
+                        server.once("error", reject);
+                        server.listen(0, "127.0.0.1", () => { server.off("error", reject); resolve(); });
+                    });
+                    this.inspectorServer = server;
+                }
+                const address = this.inspectorServer.address() as import("net").AddressInfo;
+                return { url: `http://127.0.0.1:${address.port}/`, instanceId: this.instanceId,
+                    note: "This inspector shares this session's owned preview and command queue. Runtime edits are temporary." };
+            }
             case "launch":
                 return this.launch();
             case "refresh":
@@ -1093,6 +1129,15 @@ export class RuntimeProbeService {
 
     private async disposeAfterQueue(): Promise<void> {
         await this.dispatchTail;
+        this.inspectorConnection = undefined;
+        if (this.inspectorServer) {
+            const server = this.inspectorServer;
+            this.inspectorServer = undefined;
+            await new Promise<void>((resolve, reject) => {
+                server.close(error => error ? reject(error) : resolve());
+                server.closeAllConnections();
+            });
+        }
         this.closeEvaluator();
         const browser = this.browserClient;
         try {
@@ -1118,7 +1163,20 @@ export async function runRuntimeProbeCli(
         process.stdout.write(text);
     },
 ): Promise<void> {
-    const service = createService({
+    let commandArgs = argv;
+    let remote: RuntimeProbeServiceHandle | undefined;
+    if (argv[0] === "--inspector") {
+        commandArgs = argv.slice(1);
+        let expectedInstanceId: string | undefined;
+        if (commandArgs[0] === "--instance-id") {
+            expectedInstanceId = commandArgs[1];
+            if (!expectedInstanceId) throw new Error("--instance-id requires an Inspector instance ID");
+            commandArgs = commandArgs.slice(2);
+        }
+        const { InspectorProbeClient } = await import("./runtime-inspector-bridge");
+        remote = await InspectorProbeClient.connect(runtimeProbeOptionsFromEnv().workspaceRoot ?? path.resolve(__dirname, "../.."), expectedInstanceId);
+    }
+    const service = remote ?? createService({
         ...runtimeProbeOptionsFromEnv(),
         ownership: process.env.COCOS_RUNTIME_PROBE_OWNERSHIP === "isolated"
             ? "isolated"
@@ -1126,7 +1184,7 @@ export async function runRuntimeProbeCli(
         instanceId: "manual-cli",
     });
     try {
-        const command = parseRuntimeProbeArgs(argv);
+        const command = parseRuntimeProbeArgs(commandArgs);
         const result = await service.dispatch(command);
         const output = result && typeof result === "object" && "image" in result
             ? Object.fromEntries(Object.entries(result).filter(([key]) => key !== "image")) : result;
@@ -1145,7 +1203,8 @@ export async function runRuntimeProbeCli(
 export function runtimeProbeOptionsFromEnv(
     env: NodeJS.ProcessEnv = process.env,
 ): RuntimeProbeServiceOptions {
-    const options: { previewUrl?: string; cdpOrigin?: string; browserExecutable?: string; gameExtension?: string } = {};
+    const options: { workspaceRoot?: string; previewUrl?: string; cdpOrigin?: string; browserExecutable?: string; gameExtension?: string } = {};
+    if (env.COCOS_RUNTIME_PROBE_WORKSPACE_ROOT?.trim()) options.workspaceRoot = path.resolve(env.COCOS_RUNTIME_PROBE_WORKSPACE_ROOT.trim());
     if (env.COCOS_RUNTIME_PROBE_GAME_EXTENSION?.trim()) options.gameExtension = env.COCOS_RUNTIME_PROBE_GAME_EXTENSION.trim();
     if (env.COCOS_RUNTIME_PROBE_BROWSER_EXECUTABLE?.trim()) {
         options.browserExecutable = env.COCOS_RUNTIME_PROBE_BROWSER_EXECUTABLE.trim();

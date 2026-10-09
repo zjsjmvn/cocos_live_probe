@@ -4,20 +4,31 @@
   "private": true,
   "description": "Local CLI and MCP diagnostics for a running Cocos Creator browser preview.",
   "scripts": {
+    "runtime:probe:inspector": "npm run build:inspector && electron dist-desktop/runtime-inspector-desktop.js",
+    "runtime:probe:inspector:web": "ts-node -P tsconfig.json runtime-inspector.ts",
+    "build:inspector": "node scripts/build-inspector-desktop.cjs",
+    "package:inspector": "npm run build:inspector && node scripts/package-inspector-desktop.mjs",
+    "test:inspector:desktop": "npm run build:inspector && electron dist-desktop/runtime-inspector-desktop.js --smoke-test",
+    "test:inspector:packaged": "node scripts/test-packaged-inspector.cjs",
     "runtime:probe": "ts-node -P tsconfig.json runtime-probe.ts",
     "runtime:probe:mcp": "ts-node -P tsconfig.json runtime-probe-mcp.ts --stdio",
     "runtime:probe:mcp:http": "ts-node -P tsconfig.json runtime-probe-mcp.ts --http",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "test": "ts-node -P tsconfig.json test/runtime-probe.test.ts && ts-node -P tsconfig.json test/runtime-interaction.test.ts && ts-node -P tsconfig.json test/runtime-game.test.ts",
-    "test:browser": "ts-node -P tsconfig.json test/runtime-browser-smoke.ts"
+    "test": "ts-node -P tsconfig.json test/runtime-probe.test.ts && ts-node -P tsconfig.json test/runtime-interaction.test.ts && ts-node -P tsconfig.json test/runtime-game.test.ts && ts-node -P tsconfig.json test/runtime-inspector.test.ts && ts-node -P tsconfig.json test/runtime-inspector-bridge.test.ts",
+    "test:browser": "ts-node -P tsconfig.json test/runtime-browser-smoke.ts",
+    "test:inspector:browser": "ts-node -P tsconfig.json test/runtime-inspector-browser-smoke.ts"
   },
   "devDependencies": {
+    "@electron/packager": "20.3.0",
     "@types/node": "^22.15.29",
-    "ajv": "^8.20.0",
+    "electron": "44.7.0",
     "ts-node": "^10.9.2",
     "typescript": "^5.9.2"
   },
   "engines": {
-    "node": ">=22"
+    "node": ">=22.12.0"
+  },
+  "dependencies": {
+    "ajv": "^8.20.0"
   }
 }
