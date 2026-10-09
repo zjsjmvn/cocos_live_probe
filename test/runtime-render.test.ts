@@ -37,6 +37,16 @@ async function main(): Promise<void> {
         assert.ok(shot.outputPath, "ordinary screenshots still work without drawing");
         assert.strictEqual(shot.render.status, "unverified");
     } finally { await supported.service.dispose(); }
+    const replacing = gameEnvironment("");
+    const replacementEvents = new EventEmitter();
+    let sameName = { name: "same-name", revision: 1 };
+    replacing.globals.cc.Director = { EVENT_AFTER_DRAW: "after-draw", EVENT_BEFORE_SCENE_LAUNCH: "before-scene" };
+    replacing.globals.cc.director = { getScene: () => sameName, on: replacementEvents.on.bind(replacementEvents), off: replacementEvents.off.bind(replacementEvents) };
+    try {
+        const pending = replacing.service.dispatch({ kind: "render-ready", timeoutMs: 500 });
+        setTimeout(() => { replacementEvents.emit("after-draw"); replacementEvents.emit("before-scene"); sameName = { name: "same-name", revision: 2 }; }, 50);
+        assert.strictEqual((await pending as any).status, "page-changed", "render-ready must recheck the current scene before returning");
+    } finally { await replacing.service.dispose(); }
     console.log("Runtime render tests passed");
 }
 main().catch(error => { console.error(error); process.exitCode = 1; });

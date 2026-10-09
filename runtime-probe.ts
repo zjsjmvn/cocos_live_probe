@@ -1234,7 +1234,7 @@ export class RuntimeProbeService {
         await this.dispatchTail;
         if (this.evidence.runId) {
             try { this.evidence.finish(this.evidence.runId, performance.now() + 1000, "service-closed"); }
-            catch { /* The on-disk in-progress manifest remains an incomplete record. */ }
+            catch { this.evidence.abandon(); /* The on-disk in-progress manifest remains an incomplete record. */ }
         }
         this.inspectorConnection = undefined;
         if (this.inspectorServer) {

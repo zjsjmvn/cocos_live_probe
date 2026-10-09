@@ -8,10 +8,10 @@ export async function deliveryObserver(operation: string, args: any): Promise<an
     if (operation !== "install") {
         const state = g[key];
         if (!state || state.actionId !== args.actionId) return { hit: "unknown", completeness: "partial", reason: "observation-unavailable", nodes: [], events: [] };
-        if (state.director?.getScene?.() !== state.scene) state.interference = true;
+        if (state.director?.getScene?.() !== state.scene || !state.boundaryOwned()) state.interference = true;
         const result = () => ({ actionId: state.actionId, device: state.device, status: "observed", completeness: state.complete && !state.overflow && !state.interference ? "complete" : "partial",
             hit: state.complete && !state.overflow && !state.interference ? state.nodes.length ? "hit" : "miss" : "unknown",
-            nodes: state.nodes, events: state.events, rawEvents: state.rawEvents,
+            nodes: state.nodes, events: state.events, rawEvents: state.rawEvents, unmatchedEvents: state.unmatchedEvents,
             eventSource: "public Node.dispatchEvent targets; distinct derived mouse/touch phases retained, targets and recursive dispatches deduplicated",
             reason: state.overflow ? "observation-limit" : state.interference ? "input-or-scene-association-unconfirmed" : !state.complete ? "event-processing-boundary-unconfirmed" : undefined });
         if (operation === "cancel") { state.dispose(); return result(); }
@@ -38,9 +38,9 @@ export async function deliveryObserver(operation: string, args: any): Promise<an
     if (!descriptor?.value || !descriptor.writable || !g.document?.addEventListener) return { hit: "unsupported", completeness: "partial", reason: "public-event-dispatch-unavailable" };
     if (g[key]) return { hit: "unknown", completeness: "partial", reason: "observation-already-active" };
     const original = descriptor.value;
-    const state: any = { actionId: args.actionId, device: args.device, nodes: [], events: [], rawEvents: [], rawEnd: false,
+    const state: any = { actionId: args.actionId, device: args.device, nodes: [], events: [], rawEvents: [], unmatchedEvents: [], rawEnd: false,
         complete: false, enabled: true, overflow: false, processing: new WeakSet(), director: cc.director, scene: cc.director?.getScene?.(), drawEvent: cc.Director?.EVENT_AFTER_DRAW };
-    const types = args.device === "touch" ? ["touchstart", "touchmove", "touchend", "touchcancel"] : ["mousedown", "mousemove", "mouseup"];
+    const types = args.device === "touch" ? ["touchstart", "touchmove", "touchend", "touchcancel", "mousedown", "mousemove", "mouseup"] : ["mousedown", "mousemove", "mouseup"];
     const raw = (event: any) => {
         if (!state.enabled || !event.isTrusted) return;
         const point = event.changedTouches?.[0] ?? event;
@@ -51,12 +51,26 @@ export async function deliveryObserver(operation: string, args: any): Promise<an
             return;
         }
         state.accepted = true;
-        if (["mouseup", "touchend", "touchcancel"].includes(event.type)) state.rawEnd = true;
-        if (state.rawEvents.length < 128) state.rawEvents.push({ type: event.type, x: point.clientX, y: point.clientY });
+        if ((args.device === "touch" ? ["touchend", "touchcancel"] : ["mouseup"]).includes(event.type)) state.rawEnd = true;
+        const canvas = cc.game?.canvas ?? g.document.querySelector?.("canvas");
+        const rect = canvas?.getBoundingClientRect?.();
+        if (state.rawEvents.length < 128) state.rawEvents.push({ type: event.type, x: point.clientX, y: point.clientY,
+            pointerId: event.type.startsWith("touch") ? point.identifier : 0,
+            engineX: rect?.width > 0 ? (point.clientX - rect.left) * canvas.width / rect.width : null,
+            engineY: rect?.height > 0 ? (rect.top + rect.height - point.clientY) * canvas.height / rect.height : null });
         else state.overflow = true;
     };
     const capture = (node: any, event: any) => {
         if (!state.enabled || !state.accepted || !event || !/^(touch|mouse)-(start|move|end|cancel|down|up)$/.test(event.type)) return;
+        const location = event.getLocation?.();
+        const pointerId = event.getID?.() ?? event.touch?.getID?.() ?? 0;
+        const phases: Record<string, string[]> = { "touch-start": ["mousedown", "touchstart"], "mouse-down": ["mousedown", "touchstart"],
+            "touch-move": ["mousemove", "touchmove"], "mouse-move": ["mousemove", "touchmove"], "touch-end": ["mouseup", "touchend"],
+            "mouse-up": ["mouseup", "touchend"], "touch-cancel": ["mouseup", "mousemove", "touchcancel", "touchend"] };
+        const matched = state.rawEvents.some((raw: any) => phases[event.type]?.includes(raw.type) && raw.pointerId === pointerId
+            && Number.isFinite(raw.engineX) && Number.isFinite(raw.engineY) && location
+            && Math.abs(location.x - raw.engineX) <= 3 && Math.abs(location.y - raw.engineY) <= 3);
+        if (!matched) { state.interference = true; if (state.unmatchedEvents.length < 8) state.unmatchedEvents.push({ type: event.type, pointerId, location }); return; }
         const target = event.target ?? node;
         const parts = []; let cursor = target;
         for (let i = 0; cursor && i < 64; i++, cursor = cursor.parent) parts.push(String(cursor.name).slice(0, 128));
@@ -78,6 +92,7 @@ export async function deliveryObserver(operation: string, args: any): Promise<an
         finally { if (outer) { try { capture(this, event); } catch { state.interference = true; } finally { state.processing.delete(event); } } }
     };
     let timer: ReturnType<typeof setTimeout>;
+    state.boundaryOwned = () => proto.dispatchEvent === wrapper;
     state.dispose = () => {
         state.enabled = false; clearTimeout(timer); state.cancelWait?.();
         for (const type of types) g.document.removeEventListener(type, raw, true);

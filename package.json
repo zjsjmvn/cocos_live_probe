@@ -14,7 +14,7 @@
     "runtime:probe:mcp": "ts-node -P tsconfig.json runtime-probe-mcp.ts --stdio",
     "runtime:probe:mcp:http": "ts-node -P tsconfig.json runtime-probe-mcp.ts --http",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "test": "ts-node -P tsconfig.json test/runtime-probe.test.ts && ts-node -P tsconfig.json test/runtime-interaction.test.ts && ts-node -P tsconfig.json test/runtime-game.test.ts && ts-node -P tsconfig.json test/runtime-inspector.test.ts && ts-node -P tsconfig.json test/runtime-inspector-bridge.test.ts && ts-node -P tsconfig.json test/runtime-render.test.ts && ts-node -P tsconfig.json test/runtime-evidence.test.ts",
+    "test": "ts-node -P tsconfig.json test/runtime-probe.test.ts && ts-node -P tsconfig.json test/runtime-interaction.test.ts && ts-node -P tsconfig.json test/runtime-game.test.ts && ts-node -P tsconfig.json test/runtime-inspector.test.ts && ts-node -P tsconfig.json test/runtime-inspector-bridge.test.ts && ts-node -P tsconfig.json test/runtime-render.test.ts && ts-node -P tsconfig.json test/runtime-evidence.test.ts && ts-node -P tsconfig.json test/runtime-delivery.test.ts",
     "test:browser": "ts-node -P tsconfig.json test/runtime-browser-smoke.ts",
     "test:inspector:browser": "ts-node -P tsconfig.json test/runtime-inspector-browser-smoke.ts"
   },

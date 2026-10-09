@@ -63,5 +63,9 @@ export async function waitForRender(page: PageTransport, identity: PageIdentity,
     if (performance.now() >= deadline) return { ...result, status: "timeout", observation: initial.observation };
     const latest = await observePage(bounded, identity);
     if (latest.observation.documentId !== initial.observation.documentId) return { ...result, status: "page-changed", observation: latest.observation };
+    if (result.status === "rendered") {
+        const current = await bounded.evaluate(`(${readRenderState.toString()})(0,${identity.refreshGeneration})`) as any;
+        if (current.status !== "rendered" || current.sceneId !== result.sceneId || current.confirmedAt !== result.confirmedAt) return { ...result, status: "page-changed", observation: latest.observation };
+    }
     return { ...result, observation: latest.observation };
 }

@@ -50,7 +50,7 @@ export class RuntimeEvidence {
     private diagnosticCursor = 0;
     private diagnosticCount = 0;
     private readonly sessionId = randomUUID();
-    private readonly screenshotCopies = new Map<string, string>();
+    private readonly screenshotCopies = new Map<string, { file: string; digest: string }>();
     public constructor(private readonly workspace: string, private readonly instanceId: string, root?: string, caps: EvidenceLimits = {}) {
         this.root = path.resolve(workspace, root ?? ".runtime-probe-evidence");
         this.ownerIdentity = createHash("sha256").update(path.resolve(workspace).toLowerCase()).digest("hex");
@@ -105,19 +105,23 @@ export class RuntimeEvidence {
     }
     public artifact(kind: string, value: unknown, deadline: number, commandId?: number): string | undefined {
         if (!this.active) return;
+        const existing = kind === "screenshot" ? this.screenshotCopies.get(String(value)) : undefined;
+        if (kind === "screenshot") this.screenshotCopies.delete(String(value));
         try {
             this.check(deadline);
-            if (kind === "screenshot" && this.screenshotCopies.has(String(value))) return this.screenshotCopies.get(String(value));
+            if (existing && !fs.existsSync(String(value))) { this.screenshotCopies.set(String(value), existing); return existing.file; }
             const reserve = Math.min(MAX_JSON, Math.max(2048, Math.floor(this.caps.runBytes / 4)));
-            if (kind === "screenshot" && fs.statSync(String(value)).size + this.bytes + reserve > this.caps.runBytes) { this.problem("run-byte-limit"); this.active.truncated = true; return; }
+            if (kind === "screenshot" && fs.statSync(String(value)).size + reserve > this.caps.runBytes) { this.problem("run-byte-limit"); this.active.truncated = true; return; }
             const payload: any = kind === "screenshot" ? null : limited(value);
             if (payload?.omitted) { this.problem("artifact-payload-limit"); this.active.truncated = true; }
             const data = kind === "screenshot" ? fs.readFileSync(String(value)) : Buffer.from(JSON.stringify(payload));
+            const digest = kind === "screenshot" ? createHash("sha256").update(data).digest("hex") : "";
+            if (existing?.digest === digest) { this.screenshotCopies.set(String(value), existing); return existing.file; }
             if (this.active.artifacts.length >= 1000 || this.bytes + data.length + reserve > this.caps.runBytes) { this.problem("run-byte-or-artifact-limit"); this.active.truncated = true; return; }
             const file = `${this.active.artifacts.length + 1}-${kind}.${kind === "screenshot" ? "png" : "json"}`;
             fs.writeFileSync(path.join(this.directory(), file), data, { flag: "wx" }); this.bytes += data.length;
             this.active.artifacts.push({ file, kind, bytes: data.length, commandId });
-            if (kind === "screenshot") this.screenshotCopies.set(String(value), file);
+            if (kind === "screenshot") this.screenshotCopies.set(String(value), { file, digest });
             return file;
         } catch (error) { this.problem(`artifact-unavailable: ${String(error)}`); return; }
     }
@@ -163,7 +167,8 @@ export class RuntimeEvidence {
         this.check(deadline);
         this.active.bytes = this.bytes;
         let data = JSON.stringify(this.active);
-        while (Buffer.byteLength(data) > MAX_JSON && this.active.commands.length > 1) {
+        const budget = Math.min(MAX_JSON, this.caps.runBytes - this.bytes);
+        while (Buffer.byteLength(data) > budget && this.active.commands.length > 1) {
             this.active.commands.shift(); this.active.truncated = true; this.problem("manifest-byte-limit"); data = JSON.stringify(this.active);
         }
         for (let i = 0; i < 5; i++) { this.active.bytes = this.bytes + Buffer.byteLength(data); data = JSON.stringify(this.active); }
@@ -182,7 +187,7 @@ export class RuntimeEvidence {
     private portableResult(value: unknown): unknown {
         if (value === undefined) return null;
         return JSON.parse(JSON.stringify(value, (key, item) => key === "image" ? undefined
-            : ["outputPath", "screenshotPath"].includes(key) && typeof item === "string" ? this.screenshotCopies.get(item) ?? { missing: true, reason: "screenshot-not-archived" } : item));
+            : ["outputPath", "screenshotPath"].includes(key) && typeof item === "string" ? this.screenshotCopies.get(item)?.file ?? { missing: true, reason: "screenshot-not-archived" } : item));
     }
     public recordStep(result: any, step: number, deadline: number): void {
         if (!this.active) return;

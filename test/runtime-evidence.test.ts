@@ -91,6 +91,30 @@ async function main(): Promise<void> {
             assert.strictEqual(small.globals.inputCount, 1, "archive failure never repeats an input");
             assert.ok(input.evidence || input.evidenceError);
         } finally { await small.service.dispose(); }
+        const versions = gameEnvironment("", "versions", { workspaceRoot: directory, evidenceRoot: path.join(directory, "versions") });
+        try {
+            const run: any = await versions.service.dispatch(parseRuntimeProbeArgs(["evidence", '{"action":"start"}']));
+            const destination = path.join(directory, "reused.png");
+            await versions.service.dispatch({ kind: "screenshot", outputPath: destination });
+            const changed = Buffer.from(versions.globals.screenshotData, "base64"); changed[changed.length - 1] = 1;
+            versions.globals.screenshotData = changed.toString("base64");
+            await versions.service.dispatch({ kind: "screenshot", outputPath: destination });
+            const end: any = await versions.service.dispatch(parseRuntimeProbeArgs(["evidence", JSON.stringify({ action: "finish", runId: run.runId })]));
+            const manifest = JSON.parse(fs.readFileSync(end.manifestPath, "utf8"));
+            const reports = manifest.commands.map((command: any) => JSON.parse(fs.readFileSync(path.join(end.directory, command.report), "utf8")));
+            assert.notStrictEqual(reports[0].outputPath, reports[1].outputPath, "reused output filenames retain distinct capture contents");
+            assert.strictEqual(fs.readFileSync(path.join(end.directory, reports[1].outputPath)).at(-1), 1);
+        } finally { await versions.service.dispose(); }
+        const closing = gameEnvironment("", "closing", { workspaceRoot: directory, evidenceRoot: path.join(directory, "closing"), evidenceLimits: { runBytes: 4096, totalBytes: 4096 } });
+        const closeRun: any = await closing.service.dispatch(parseRuntimeProbeArgs(["evidence", '{"action":"start"}']));
+        for (let i = 0; i < 20; i++) await closing.service.dispatch({ kind: "status" });
+        await closing.service.dispose();
+        const closeReader = gameEnvironment("", "close-reader", { workspaceRoot: directory, evidenceRoot: path.join(directory, "closing") });
+        try {
+            const end: any = await closeReader.service.dispatch(parseRuntimeProbeArgs(["evidence", JSON.stringify({ action: "export", runId: closeRun.runId })]));
+            assert.notStrictEqual(end.runState, "in-progress", "a disposed owner cannot remain active");
+            assert.strictEqual(end.evidenceStatus, "partial");
+        } finally { await closeReader.service.dispose(); }
         const cli = gameEnvironment("", "cli", { workspaceRoot: directory, evidenceRoot: path.join(directory, "cli"), evidence: true });
         let output = "";
         await runRuntimeProbeCli(["screenshot"], () => cli.service, text => { output += text; });
