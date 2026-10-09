@@ -470,13 +470,23 @@ export class RuntimeProbeService {
                 diagnostics: after => this.diagnostics.read({ after, limit: 50 }),
                 input: async (decision, before, operationDeadline) => {
                     const page = checkedPage(operationDeadline);
-                    const latest = await read(operationDeadline);
-                    const bridge = latest.bridge as { instanceId?: string };
-                    if (latest.observation.documentId !== before.documentId || bridge.instanceId !== before.bridgeInstanceId) {
-                        throw new GameFailure("page-changed", "Game page or bridge changed before input");
-                    }
+                    const validateBridge = (bridge: unknown) => {
+                        if ((bridge as { instanceId?: string })?.instanceId !== before.bridgeInstanceId) {
+                            throw new GameFailure("page-changed", "Game bridge changed before input");
+                        }
+                    };
+                    const validateObservation = async () => {
+                        const latest = await read(operationDeadline);
+                        if (latest.observation.documentId !== before.documentId || latest.observation.targetId !== before.targetId
+                            || latest.observation.refreshGeneration !== before.refreshGeneration) {
+                            throw new GameFailure("page-changed", "Game page changed before input");
+                        }
+                        validateBridge(latest.bridge);
+                    };
+                    await validateObservation();
                     const identity = { targetId: this.targetId!, instanceId: this.instanceId, refreshGeneration: this.refreshGeneration };
                     const screenshot = await captureScreenshot(page, identity, this.artifactDirectory);
+                    await validateObservation();
                     const remaining = Math.floor(operationDeadline - performance.now());
                     if (remaining < 100) throw new GameFailure("time-limit", "Insufficient time for input");
                     const input = parseInteractionCommand("input", { ...decision.input, observation: screenshot.observation, timeoutMs: remaining });
@@ -485,7 +495,9 @@ export class RuntimeProbeService {
                     this.operationDeadline = undefined;
                     const result = await sendInput(evaluator as PageTransport, identity, input, async ms => {
                         if (!active || !this.acceptingDispatches) throw new GameFailure("stopped", "Game context is no longer active");
-                        return this.resolveOwnedTarget(ms);
+                        await this.resolveOwnedTarget(ms);
+                        const inputPage = deadlineTransport(evaluator as PageTransport, operationDeadline);
+                        validateBridge(await inputPage.evaluate(`(${readGameBridge.toString()})(${JSON.stringify(this.game!.extension.bridgeName)})`));
                     });
                     return { ...result, screenshotPath: screenshot.outputPath };
                 },
@@ -1114,10 +1126,11 @@ export async function runRuntimeProbeCli(
         instanceId: "manual-cli",
     });
     try {
-        const result = await service.dispatch(parseRuntimeProbeArgs(argv));
+        const command = parseRuntimeProbeArgs(argv);
+        const result = await service.dispatch(command);
         const output = result && typeof result === "object" && "image" in result
             ? Object.fromEntries(Object.entries(result).filter(([key]) => key !== "image")) : result;
-        writeOutput(`${JSON.stringify(output, null, 2)}\n`);
+        writeOutput(`${JSON.stringify(output, null, command.kind.startsWith("game-") ? undefined : 2)}\n`);
     } finally {
         await service.dispose();
     }

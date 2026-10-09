@@ -2,7 +2,7 @@ import * as assert from "assert";
 import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
-import { RuntimeProbeService, parseRuntimeProbeArgs } from "../runtime-probe";
+import { RuntimeProbeService, parseRuntimeProbeArgs, runRuntimeProbeCli } from "../runtime-probe";
 import { gameEnvironment } from "./fixtures/game-environment";
 import { handleRuntimeProbeMcpMessage } from "../runtime-probe-mcp";
 import { createRuntimeProbeMcpHttpServer, runRuntimeProbeMcpStdio } from "../runtime-probe-mcp";
@@ -88,6 +88,17 @@ async function main(): Promise<void> {
             assert.strictEqual(changed.reason, "page-changed");
             assert.strictEqual(changing.globals.inputCount, 0, "bridge replacement stops input");
         } finally { await changing.service.dispose(); }
+        for (const moment of ["replaceBridgeOnScreenshot", "replaceBridgeOnFocus"] as const) {
+            const replacing = gameEnvironment(entry);
+            try {
+                replacing.globals[moment] = true;
+                const changed = await replacing.service.dispatch(parseRuntimeProbeArgs(["game-step", JSON.stringify({ goal: { count: 1 } })])) as any;
+                assert.strictEqual(changed.goalReached, false);
+                assert.strictEqual(changed.reason, "page-changed", `${moment} reports the bridge change`);
+                assert.strictEqual(replacing.globals.inputCount, 0, `${moment} prevents stale input`);
+                assert.strictEqual(replacing.globals.count, 0);
+            } finally { await replacing.service.dispose(); }
+        }
         const other = gameEnvironment(entry, "other-game");
         try {
             const otherState = await other.service.dispatch(parseRuntimeProbeArgs(["game-state"])) as any;
@@ -107,6 +118,18 @@ async function main(): Promise<void> {
             assert.ok(stalled.steps >= 2);
             assert.strictEqual(waiting.globals.inputCount, 0);
         } finally { await waiting.service.dispose(); }
+        const unresponsive = gameEnvironment(entry);
+        try {
+            unresponsive.globals.blocked = true;
+            const stalled = await unresponsive.service.dispatch(parseRuntimeProbeArgs(["game-autoplay", JSON.stringify({
+                goal: { count: 1 }, timeoutMs: 2000, noProgressTimeoutMs: 350,
+            })])) as any;
+            assert.strictEqual(stalled.reason, "no-progress", "no-progress budget bounds pending business verification");
+            assert.ok(stalled.elapsedMs < 1000);
+            assert.strictEqual(stalled.input.cleanupConfirmed, true);
+            assert.strictEqual(unresponsive.globals.inputCount, 1);
+            assert.strictEqual(unresponsive.globals.pressed, false);
+        } finally { await unresponsive.service.dispose(); }
         const slowEntry = path.join(directory, "slow.cjs");
         fs.writeFileSync(slowEntry, `module.exports = { ...require('./extension.cjs'),
             decide: async () => { await new Promise(resolve => setTimeout(resolve, 100));
@@ -119,6 +142,12 @@ async function main(): Promise<void> {
             assert.strictEqual(slow.globals.inputCount, 0, "late plugin completion cannot send input");
             const recovered = await slow.service.dispatch(parseRuntimeProbeArgs(["game-state"])) as any;
             assert.strictEqual(recovered.state.count, 0, "timeout leaves the queue usable");
+            const stalled = await slow.service.dispatch(parseRuntimeProbeArgs(["game-autoplay", JSON.stringify({
+                goal: { count: 1 }, timeoutMs: 1000, noProgressTimeoutMs: 60,
+            })])) as any;
+            assert.strictEqual(stalled.reason, "no-progress", "no-progress budget bounds an asynchronous decision");
+            await new Promise(resolve => setTimeout(resolve, 130));
+            assert.strictEqual(slow.globals.inputCount, 0, "an expired no-progress budget cannot be reset by late input");
         } finally { await slow.service.dispose(); }
         const queued = gameEnvironment(slowEntry);
         try {
@@ -128,6 +157,21 @@ async function main(): Promise<void> {
             await assert.rejects(second, /timeout/i);
             assert.strictEqual(queued.globals.inputCount, 1, "expired queued command does not send input");
         } finally { await queued.service.dispose(); }
+        const largeState = gameEnvironment(entry);
+        try {
+            largeState.globals.extraState = { samples: Array(12000).fill(1) };
+            const response = await handleRuntimeProbeMcpMessage({ jsonrpc: "2.0", id: 1, method: "tools/call",
+                params: { name: "game_step", arguments: { goal: { count: 1 } } } }, command => largeState.service.dispatch(command), largeState.service) as any;
+            const reportText = response.result.content[0].text;
+            assert.ok(Buffer.byteLength(reportText) <= 256 * 1024, "serialized MCP game reports respect the 256 KiB cap");
+            assert.strictEqual(JSON.parse(reportText).reason, "goal-reached");
+        } finally { await largeState.service.dispose(); }
+        const largeCli = gameEnvironment(entry);
+        largeCli.globals.extraState = { samples: Array(12000).fill(1) };
+        let cliOutput = "";
+        await runRuntimeProbeCli(["game-step", JSON.stringify({ goal: { count: 1 } })], () => largeCli.service, text => { cliOutput += text; });
+        assert.ok(Buffer.byteLength(cliOutput.trim()) <= 256 * 1024, "serialized CLI game reports respect the 256 KiB cap");
+        assert.strictEqual(JSON.parse(cliOutput).reason, "goal-reached");
         const stdio = gameEnvironment(entry);
         let output = "";
         await runRuntimeProbeMcpStdio(stdio.service, Readable.from([JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/list" }) + "\n"]), text => { output += text; });

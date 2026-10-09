@@ -336,11 +336,12 @@ export async function sendInput(page: PageTransport, identity: PageIdentity, com
     const heldKeys: ReturnType<typeof keyDescription>[] = [];
     let modifiers = 0;
     let errorMessage: string | undefined;
+    let failureReason: string | undefined;
     const send = async (method: string, params: Record<string, unknown>) => {
-        await validateTarget(Math.max(1, deadline - performance.now()));
         const latest = await observePage(boundedPage, identity);
         if (latest.observation.documentId !== expected.documentId) throw new Error("Page changed during input");
         if (latest.observation.geometryKey !== expected.geometryKey) throw new Error("Page geometry changed during input");
+        await validateTarget(Math.max(1, deadline - performance.now()));
         return boundedPage.send(method, params);
     };
     const pause = async (ms: number) => {
@@ -383,7 +384,10 @@ export async function sendInput(page: PageTransport, identity: PageIdentity, com
             } else await pause(command.durationMs);
         }
         completed = true;
-    } catch (error) { errorMessage = error instanceof Error ? error.message : String(error); }
+    } catch (error) {
+        errorMessage = error instanceof Error ? error.message : String(error);
+        if (error instanceof Error && "reason" in error && typeof error.reason === "string") failureReason = error.reason;
+    }
     finally {
         const cleanupDeadline = performance.now() + 3000;
         const cleanup = async (method: string, params: Record<string, unknown>) => {
@@ -404,6 +408,7 @@ export async function sendInput(page: PageTransport, identity: PageIdentity, com
     return { ...identity, observation: current.observation, capturedAt: new Date().toISOString(),
         status: completed && cleanupConfirmed ? "sent" : "failed", located: Boolean(point) || command.action === "key",
         started, completed: completed && cleanupConfirmed, cleanupConfirmed, point, to: end,
+        ...(failureReason ? { failureReason } : {}),
         ...(errorMessage ? { error: errorMessage } : !cleanupConfirmed ? { error: "Input cleanup could not be confirmed" } : {}) };
 }
 

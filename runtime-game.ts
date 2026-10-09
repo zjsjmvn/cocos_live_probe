@@ -71,9 +71,11 @@ async function within<T>(deadline: number, operation: () => T | Promise<T>): Pro
     if (remaining <= 0) throw new GameFailure("time-limit", "Game operation total timeout exceeded");
     let timer: ReturnType<typeof setTimeout> | undefined;
     try {
-        return await Promise.race([Promise.resolve().then(operation), new Promise<never>((_, reject) => {
+        const result = await Promise.race([Promise.resolve().then(operation), new Promise<never>((_, reject) => {
             timer = setTimeout(() => reject(new GameFailure("time-limit", "Game operation total timeout exceeded")), remaining);
         })]);
+        if (performance.now() >= deadline) throw new GameFailure("time-limit", "Game operation total timeout exceeded");
+        return result;
     } finally { if (timer) clearTimeout(timer); }
 }
 
@@ -158,6 +160,8 @@ export class RuntimeGame {
         let after: GameObservation | undefined;
         let steps = 0;
         let lastProgress = performance.now();
+        let stepDeadline = deadline;
+        let expirationReason = "time-limit";
         const records: GameStepResult[] = [];
         let status = "limited", reason = "step-limit", error: string | undefined;
         try {
@@ -165,9 +169,11 @@ export class RuntimeGame {
             do {
                 if (performance.now() >= deadline) { reason = "time-limit"; break; }
                 if (performance.now() - lastProgress >= request.noProgressTimeoutMs) { status = "failed"; reason = "no-progress"; break; }
-                const stepDeadline = Math.min(deadline, performance.now() + 10_000);
+                const progressDeadline = request.kind === "game-autoplay" ? lastProgress + request.noProgressTimeoutMs : Infinity;
+                stepDeadline = Math.min(deadline, performance.now() + 10_000, progressDeadline);
+                expirationReason = stepDeadline === progressDeadline && progressDeadline < deadline ? "no-progress" : "time-limit";
                 steps++;
-                const result = await this.step(request, port, after, stepDeadline);
+                const result = await this.step(request, port, after, stepDeadline, expirationReason);
                 after = result.after;
                 if (result.decision.kind === "done") steps--;
                 records.push(result);
@@ -178,7 +184,8 @@ export class RuntimeGame {
                 }
             } while (steps < request.maxSteps);
         } catch (caught) {
-            reason = caught instanceof GameFailure ? caught.reason : /bridge|gameId|stateVersion/i.test(String(caught)) ? "bridge-unavailable"
+            reason = caught instanceof GameFailure ? caught.reason === "time-limit" ? expirationReason : caught.reason
+                : performance.now() >= stepDeadline ? expirationReason : /bridge|gameId|stateVersion/i.test(String(caught)) ? "bridge-unavailable"
                 : /target|document|context|URL/i.test(String(caught)) ? "page-changed" : "plugin-error";
             status = reason === "time-limit" ? "limited" : "failed";
             error = String(caught).slice(0, 2000);
@@ -207,7 +214,7 @@ export class RuntimeGame {
         return jsonState(decision, "Game decision") as unknown as GameDecision;
     }
 
-    private async step(request: GameRequest, port: GamePort, before: GameObservation, deadline: number): Promise<GameStepResult> {
+    private async step(request: GameRequest, port: GamePort, before: GameObservation, deadline: number, expirationReason: string): Promise<GameStepResult> {
         const decision = await this.decide(before.state, request, deadline);
         let after = before;
         let input: unknown;
@@ -217,32 +224,38 @@ export class RuntimeGame {
                 before, after, decision, verification };
         }
         try {
-        if (decision.kind === "wait") {
-            const duration = budget(decision.durationMs, 100, "wait durationMs", 1000);
-            await within(deadline, () => new Promise<void>(resolve => setTimeout(resolve, Math.min(duration, Math.max(1, deadline - performance.now())))));
-        } else {
-            input = await port.input(decision, before, deadline);
-            if (gameRecord(input, "Input result").status !== "sent") {
-                return { status: "failed", reason: "input-failed", before, after, decision, input, verification };
+            if (decision.kind === "wait") {
+                const duration = budget(decision.durationMs, 100, "wait durationMs", 1000);
+                await within(deadline, () => new Promise<void>(resolve => setTimeout(resolve, Math.min(duration, Math.max(1, deadline - performance.now())))));
+            } else {
+                if (performance.now() >= deadline) throw new GameFailure("time-limit", "Game operation timeout exceeded before input");
+                input = await port.input(decision, before, deadline);
+                const inputResult = gameRecord(input, "Input result");
+                if (inputResult.status !== "sent") {
+                    const failureReason = typeof inputResult.failureReason === "string" && ["page-changed", "stopped"].includes(inputResult.failureReason)
+                        ? inputResult.failureReason : performance.now() >= deadline && expirationReason === "no-progress" ? "no-progress" : "input-failed";
+                    return { status: "failed", reason: failureReason,
+                        before, after, decision, input, verification };
+                }
             }
-        }
-        do {
-            after = await this.observe(port, deadline, before);
-            verification = jsonState(await within(deadline, () => this.extension.verify(before.state, after.state, decision, request.goal)), "Game verification") as unknown as GameVerification;
-            if (!verification || !["satisfied", "pending", "blocked"].includes(verification.status) || typeof verification.progress !== "boolean") {
-                throw new GameFailure("plugin-error", "Invalid game verification");
-            }
-            if (verification.status !== "pending" || decision.kind === "wait") break;
-            if (deadline - performance.now() <= 50) {
-                return { status: "failed", reason: "result-unknown", before, after, decision, input, verification };
-            }
-            await new Promise<void>(resolve => setTimeout(resolve, 50));
-        } while (true);
-        const finished = (await this.decide(after.state, request, deadline)).kind === "done";
-        return { status: verification.status === "blocked" ? "failed" : finished ? "completed" : "stepped",
-            reason: verification.status === "blocked" ? "blocked" : finished ? "goal-reached" : "step-complete",
-            before, after, decision, input, verification };
+            do {
+                after = await this.observe(port, deadline, before);
+                verification = jsonState(await within(deadline, () => this.extension.verify(before.state, after.state, decision, request.goal)), "Game verification") as unknown as GameVerification;
+                if (!verification || !["satisfied", "pending", "blocked"].includes(verification.status) || typeof verification.progress !== "boolean") {
+                    throw new GameFailure("plugin-error", "Invalid game verification");
+                }
+                if (verification.status !== "pending" || decision.kind === "wait") break;
+                await within(deadline, () => new Promise<void>(resolve => setTimeout(resolve, Math.min(50, Math.max(1, deadline - performance.now())))));
+            } while (true);
+            const finished = (await this.decide(after.state, request, deadline)).kind === "done";
+            return { status: verification.status === "blocked" ? "failed" : finished ? "completed" : "stepped",
+                reason: verification.status === "blocked" ? "blocked" : finished ? "goal-reached" : "step-complete",
+                before, after, decision, input, verification };
         } catch (error) {
+            if (expirationReason === "no-progress" && (performance.now() >= deadline || error instanceof GameFailure && error.reason === "time-limit")) {
+                if (input) return { status: "failed", reason: "no-progress", before, after, decision, input, verification };
+                throw new GameFailure("no-progress", "Game operation no-progress timeout exceeded");
+            }
             if (input) return { status: "failed", reason: error instanceof GameFailure && error.reason === "page-changed" ? "page-changed"
                 : performance.now() >= deadline ? "result-unknown" : "plugin-error", before, after, decision, input, verification,
                 error: String(error).slice(0, 2000) };

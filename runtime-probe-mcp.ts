@@ -366,7 +366,7 @@ async function handleToolCall(
             ] });
         }
         return jsonRpcResult(id, {
-            content: [{ type: "text", text: JSON.stringify(value ?? null, null, 2) }],
+            content: [{ type: "text", text: JSON.stringify(value ?? null, null, command.kind.startsWith("game-") ? undefined : 2) }],
             ...(value && typeof value === "object" && "status" in value
                 && (value.status === "failed" || value.status === "timeout") ? { isError: true } : {}),
         });
