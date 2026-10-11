@@ -7,10 +7,12 @@ import { createElectronProbeDependencies } from "./runtime-electron-adapter";
 import { createRuntimeInspectorServer } from "./runtime-inspector";
 import { startInspectorBridge } from "./runtime-inspector-bridge";
 import { createRuntimeProbeWorkspaceDefaults, RuntimeProbeService, runtimeProbeOptionsFromEnv } from "./runtime-probe";
+import { buildPreviewToolsExpression, parsePreviewToolRequest, PreviewInteractionMode } from "./runtime-inspector-preview-tools";
+import { InspectorPreferences, parseInspectorPreferences } from "./runtime-inspector-preferences";
 
-const workspaceRoot = app.isPackaged
-    ? path.resolve(process.env.COCOS_RUNTIME_PROBE_WORKSPACE_ROOT || path.join(path.dirname(app.getPath("exe")), "../../../.."))
-    : path.resolve(__dirname, "../../..");
+const workspaceRoot = path.resolve(process.env.COCOS_RUNTIME_PROBE_WORKSPACE_ROOT || (app.isPackaged
+    ? path.join(path.dirname(app.getPath("exe")), "../../../..")
+    : path.join(__dirname, "../../..")));
 const identity = createRuntimeProbeWorkspaceDefaults(workspaceRoot).identity;
 const desktopInstanceId = `desktop-${randomUUID()}`;
 const smokeMode = process.argv.includes("--smoke-test");
@@ -28,7 +30,7 @@ app.setPath("userData", path.join(app.getPath("appData"), `cocos-live-probe-${id
 let window: BrowserWindow | undefined;
 let gameView: WebContentsView | undefined;
 let devToolsView: WebContentsView | undefined;
-let panelMode: "nodes" | "devtools" = "nodes";
+let panelMode: "nodes" | "devtools" | "workbench" = "nodes";
 let service: RuntimeProbeService | undefined;
 let server: import("http").Server | undefined;
 let bridgeServer: import("http").Server | undefined;
@@ -36,6 +38,26 @@ let quitting = false;
 let previewBounds = { x: 0, y: 48, width: 680, height: 800 };
 let devToolsBounds = { x: 680, y: 78, width: 760, height: 800 };
 let boundsRevision = 0;
+let previewResolution = { width: 0, height: 0 };
+let previewMode: PreviewInteractionMode = "off";
+let previewFps: boolean | null = null;
+const appearancePath = path.join(app.getPath("userData"), "appearance.json");
+function savedAppearance(): { theme: "graphite" | "midnight" | "light"; density: "comfortable" | "compact"; preferences: InspectorPreferences } {
+    try {
+        const stored = JSON.parse(fs.readFileSync(appearancePath, "utf8"));
+        return { theme: stored.theme === "midnight" || stored.theme === "light" ? stored.theme : "graphite",
+            density: stored.density === "compact" ? "compact" : "comfortable", preferences: parseInspectorPreferences(stored.preferences || {}) };
+    } catch { /* Missing or invalid preferences use the default appearance. */ }
+    return { theme: "graphite", density: "comfortable", preferences: {} };
+}
+function savedTheme() { return savedAppearance().theme; }
+function saveAppearance(update: Partial<ReturnType<typeof savedAppearance>>) {
+    const appearance = { ...savedAppearance(), ...update };
+    fs.mkdirSync(path.dirname(appearancePath), { recursive: true });
+    fs.writeFileSync(appearancePath + ".tmp", JSON.stringify(appearance), "utf8");
+    fs.renameSync(appearancePath + ".tmp", appearancePath);
+    return appearance;
+}
 
 function isPanelSender(sender: Electron.WebContents): boolean {
     return !!window && !window.isDestroyed() && sender === window.webContents;
@@ -68,7 +90,7 @@ function destroyDevToolsView(): void {
     if (window && !window.isDestroyed()) window.webContents.send("inspector:panel-mode", "nodes");
 }
 
-function selectPanel(mode: "nodes" | "devtools"): void {
+function selectPanel(mode: "nodes" | "devtools" | "workbench"): void {
     if (mode === "devtools") {
         if (!gameView || gameView.webContents.isDestroyed()) throw new Error("游戏预览尚未连接");
         if (!devToolsView) {
@@ -87,14 +109,73 @@ function selectPanel(mode: "nodes" | "devtools"): void {
     panelMode = mode; devToolsView?.setVisible(mode === "devtools"); applyBounds();
 }
 
+// 「等比缩放预览」是用 webContents.setZoomFactor() 实现的，而 Chromium 的页面缩放会连乘进
+// window.devicePixelRatio。Cocos 引擎只在它自己的 dpr media-query 状态翻转时才重算画布后备
+// （pal/screen-adapter/web/screen-adapter.js 的 updateDPRChangeListener），而该查询用的是被
+// Math.min(dpr, 2) 钳位后的值 —— 真实 dpr 一旦越过 2，这个查询就永远处于不匹配态，状态不会再
+// 翻转，画布后备会被永久冻结。此后 输入换算用的 dpr 与 canvas.width 脱节，命中位置随时间成比例
+// 偏移（ratio < 1 时点上面的按钮会命中下面那个）。所以每次改过 zoom 之后，都让渲染根按当前 dpr
+// 重算一次。注入体是幂等的：只有真的对不上才动手。
+const GAME_VIEWPORT_SYNC = `(() => {
+    const cc = globalThis.cc;
+    const canvas = cc && cc.game && cc.game.canvas;
+    const root = cc && cc.director && cc.director.root;
+    if (!canvas || !root) return "engine-not-ready";
+    let target = null;
+    try {
+        const size = cc.screen && cc.screen.windowSize;
+        if (size && size.width > 0 && size.height > 0) target = { width: size.width, height: size.height };
+    } catch (error) { /* 回退到画布 rect × dpr 的估算 */ }
+    if (!target) {
+        const dpr = (cc.screen && cc.screen.devicePixelRatio) || Math.min(window.devicePixelRatio || 1, 2);
+        const rect = canvas.getBoundingClientRect();
+        target = { width: rect.width * dpr, height: rect.height * dpr };
+    }
+    if (Math.abs(canvas.width - target.width) <= 1 && Math.abs(canvas.height - target.height) <= 1) return "synced";
+    root.resize(target.width, target.height, 1);
+    return "resized";
+})()`;
+let viewportSyncSchedule: ReturnType<typeof setTimeout> | undefined;
+// 预览布局每次变化后核对一次画布后备。setZoomFactor 会改 dpr，把窗口移到另一块缩放不同的
+// 显示器也会改，而引擎在钳位之后就不再跟踪 dpr 了。注入体是幂等的，这里再做一次防抖。
+function scheduleGameViewportSync(): void {
+    if (viewportSyncSchedule) clearTimeout(viewportSyncSchedule);
+    viewportSyncSchedule = setTimeout(() => {
+        viewportSyncSchedule = undefined;
+        if (!service || !gameView || gameView.webContents.isDestroyed() || gameView.webContents.isLoading()) return;
+        void service.dispatch({ kind: "eval", expression: GAME_VIEWPORT_SYNC }).catch(() => { /* 页面可能在缩放期间导航或退出 */ });
+    }, 160);
+}
+
 function applyBounds(): void {
     if (!window || window.isDestroyed()) return;
     const [width, height] = window.getContentSize();
     for (const [view, bounds] of [[gameView, previewBounds], [devToolsView, devToolsBounds]] as const) {
         if (!view) continue;
         const x = Math.min(bounds.x, width); const y = Math.min(bounds.y, height);
-        view.setBounds({ x, y, width: Math.max(0, Math.min(bounds.width, width - x)), height: Math.max(0, Math.min(bounds.height, height - y)) });
+        const availableWidth = Math.max(0, Math.min(bounds.width, width - x)), availableHeight = Math.max(0, Math.min(bounds.height, height - y));
+        if (view === gameView && previewResolution.width && availableWidth && availableHeight) {
+            const scale = Math.min(availableWidth / previewResolution.width, availableHeight / previewResolution.height, 2);
+            const gameWidth = Math.floor(previewResolution.width * scale), gameHeight = Math.floor(previewResolution.height * scale);
+            if (Math.abs(view.webContents.getZoomFactor() - scale) > 0.0001) view.webContents.setZoomFactor(scale);
+            view.setBounds({ x: Math.round(x + (availableWidth - gameWidth) / 2), y: Math.round(y + (availableHeight - gameHeight) / 2), width: gameWidth, height: gameHeight });
+        } else {
+            if (view === gameView && view.webContents.getZoomFactor() !== 1) view.webContents.setZoomFactor(1);
+            view.setBounds({ x, y, width: availableWidth, height: availableHeight });
+        }
     }
+    scheduleGameViewportSync();
+}
+async function previewToolState(): Promise<any> {
+    const state = await service!.dispatch({ kind: "eval", expression: buildPreviewToolsExpression({ action: "state" }) }) as any;
+    return { ...state, muted: gameView!.webContents.isAudioMuted(), resolution: previewResolution };
+}
+async function restorePreviewTools(): Promise<void> {
+    await service!.dispatch({ kind: "launch" });
+    if (previewFps !== null) await service!.dispatch({ kind: "eval", expression: buildPreviewToolsExpression({ action: "fps", enabled: previewFps }) });
+    if (previewMode !== "off") await service!.dispatch({ kind: "eval", expression: buildPreviewToolsExpression({ action: "mode", mode: previewMode }) });
+    const state = await previewToolState();
+    if (window && !window.isDestroyed()) window.webContents.send("inspector:game-tool-event", { kind: "state", state });
 }
 async function shutdown(exitCode = 0): Promise<void> {
     if (quitting) return; quitting = true;
@@ -108,13 +189,19 @@ async function shutdown(exitCode = 0): Promise<void> {
 
 async function start(): Promise<void> {
     Menu.setApplicationMenu(null);
+    const theme = savedTheme();
     window = new BrowserWindow({ width: 1460, height: 940, minWidth: 960, minHeight: 640,
-        title: "Cocos Live Probe Inspector", backgroundColor: "#252526", show: false,
+        title: "Cocos Live Probe Inspector", backgroundColor: theme === "light" ? "#eef1f5" : theme === "midnight" ? "#111824" : "#16191f", show: false,
         webPreferences: { preload: path.join(__dirname, "inspector/desktop-preload.cjs"), nodeIntegration: false, contextIsolation: true, sandbox: true, backgroundThrottling: false },
     });
     const native = createElectronProbeDependencies(view => {
         gameView = view; window!.contentView.addChildView(view); applyBounds();
         view.webContents.on("devtools-closed", destroyDevToolsView);
+        view.webContents.on("did-finish-load", () => {
+            if (previewFps !== null || previewMode !== "off") void restorePreviewTools().catch(error => {
+                if (window && !window.isDestroyed()) window.webContents.send("inspector:game-tool-event", { kind: "error", message: String(error) });
+            });
+        });
     }, view => {
         view.webContents.closeDevTools(); destroyDevToolsView();
         if (window && !window.isDestroyed()) window.contentView.removeChildView(view);
@@ -124,7 +211,7 @@ async function start(): Promise<void> {
     service = new RuntimeProbeService({ ...runtimeProbeOptionsFromEnv(), workspaceRoot, browserExecutable: "",
         instanceId: desktopInstanceId, ownership: "isolated", readyTimeoutMs: 30000, dependencies: native,
     });
-    server = createRuntimeInspectorServer(service);
+    server = createRuntimeInspectorServer(service, savedTheme, () => savedAppearance().density);
     await new Promise<void>((resolve, reject) => { server!.once("error", reject); server!.listen(0, "127.0.0.1", resolve); });
     const origin = `http://127.0.0.1:${(server.address() as import("net").AddressInfo).port}`;
     const bridge = await startInspectorBridge(service, { workspaceRoot: bridgeWorkspaceRoot, instanceId: desktopInstanceId,
@@ -132,8 +219,55 @@ async function start(): Promise<void> {
         onCommand: kind => { if (window && !window.isDestroyed()) window.webContents.send("inspector:ai-activity", { kind, at: Date.now() }); },
     });
     bridgeServer = bridge.server;
+    ipcMain.handle("inspector:theme-save", (event, selected) => {
+        if (!isPanelSender(event.sender) || !["graphite", "midnight", "light"].includes(selected)) throw new Error("Invalid inspector theme");
+        const appearance = saveAppearance({ theme: selected });
+        window!.setBackgroundColor(selected === "light" ? "#eef1f5" : selected === "midnight" ? "#111824" : "#16191f");
+        return appearance;
+    });
+    ipcMain.handle("inspector:density-save", (event, selected) => {
+        if (!isPanelSender(event.sender) || !["comfortable", "compact"].includes(selected)) throw new Error("Invalid inspector density");
+        return saveAppearance({ density: selected });
+    });
+    ipcMain.handle("inspector:preferences", (event, request) => {
+        if (!isPanelSender(event.sender) || !request || typeof request !== "object") throw new Error("Unknown inspector sender");
+        if (request.action === "get" && Object.keys(request).length === 1) return savedAppearance().preferences;
+        if (request.action !== "set" || Object.keys(request).length !== 2) throw new Error("Invalid preference request");
+        return saveAppearance({ preferences: parseInspectorPreferences(request.value) }).preferences;
+    });
     window.webContents.setWindowOpenHandler(() => ({ action: "deny" }));
     window.webContents.on("will-navigate", (event, destination) => { if (destination !== origin + "/desktop") event.preventDefault(); });
+    ipcMain.handle("inspector:preview-tool", async (event, value) => {
+        if (!isPanelSender(event.sender) || !gameView || gameView.webContents.isDestroyed()) throw new Error("Unknown inspector sender or unavailable preview");
+        const request = parsePreviewToolRequest(value);
+        if (request.action === "mute") gameView.webContents.setAudioMuted(request.enabled);
+        else if (request.action === "cache") {
+            if (request.operation === "http") await gameView.webContents.session.clearCache();
+            else await gameView.webContents.session.clearStorageData({ storages: ["cookies"] });
+        }
+        else if (request.action === "resolution") {
+            const previous = previewResolution;
+            try { previewResolution = { width: request.width, height: request.height }; applyBounds(); }
+            catch (error) { previewResolution = previous; applyBounds(); throw error; }
+            await new Promise(resolve => setTimeout(resolve, 80));
+        } else {
+            await service!.dispatch({ kind: "eval", expression: buildPreviewToolsExpression(request) });
+            if (request.action === "fps") previewFps = request.enabled;
+            if (request.action === "mode") previewMode = request.mode;
+        }
+        return previewToolState();
+    });
+    ipcMain.on("inspector:game-tool-event", (event, payload) => {
+        if (!gameView || event.sender !== gameView.webContents || event.senderFrame !== gameView.webContents.mainFrame
+            || !payload || typeof payload !== "object" || !window || window.isDestroyed()) return;
+        if (["select", "drag"].includes(payload.kind) && typeof payload.uuid === "string" && payload.uuid.length <= 256) {
+            window.webContents.send("inspector:game-tool-event", { kind: payload.kind, uuid: payload.uuid });
+        } else if (payload.kind === "mode" && payload.mode === "off") {
+            previewMode = "off"; window.webContents.send("inspector:game-tool-event", { kind: "mode", mode: "off" });
+        } else if (payload.kind === "error" && typeof payload.message === "string") {
+            window.webContents.send("inspector:game-tool-event", { kind: "error", message: payload.message.slice(0, 1000) });
+        }
+    });
     ipcMain.on("inspector:bounds", (event, bounds) => {
         if (!isPanelSender(event.sender) || !bounds || !["x", "y", "width", "height"].every(key => Number.isFinite(bounds[key]) && bounds[key] >= 0)) return;
         previewBounds = Object.fromEntries(Object.entries(bounds).filter(([key]) => ["x", "y", "width", "height"].includes(key)).map(([key, value]) => [key, Math.round(Number(value))])) as typeof previewBounds;
@@ -151,7 +285,7 @@ async function start(): Promise<void> {
         return service!.dispatch({ kind: "refresh" });
     });
     ipcMain.handle("inspector:panel-mode", (event, mode) => {
-        if (!isPanelSender(event.sender) || !["nodes", "devtools"].includes(mode)) throw new Error("Invalid inspector panel request");
+        if (!isPanelSender(event.sender) || !["nodes", "devtools", "workbench"].includes(mode)) throw new Error("Invalid inspector panel request");
         selectPanel(mode); return { mode: panelMode };
     });
     ipcMain.handle("inspector:devtools-close", event => {

@@ -2,8 +2,19 @@ import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { createHash } from "node:crypto";
+import { execFileSync } from "node:child_process";
 import { packager } from "@electron/packager";
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+const output = path.resolve(root, process.env.COCOS_INSPECTOR_PACKAGE_OUTPUT || "releases");
+if (!output.startsWith(root + path.sep)) throw new Error("Package output must remain inside this workspace");
+const executable = path.join(output, "Cocos Live Probe Inspector-win32-x64/Cocos Live Probe Inspector.exe");
+if (process.platform === "win32" && fs.existsSync(executable)) {
+    // Check before packager's overwrite removes any runtime files.
+    const running = execFileSync("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command",
+        "Get-CimInstance Win32_Process | Where-Object { $_.ExecutablePath -eq $env:COCOS_INSPECTOR_PACKAGE_TARGET } | Select-Object -ExpandProperty ProcessId"],
+        { encoding: "utf8", windowsHide: true, env: { ...process.env, COCOS_INSPECTOR_PACKAGE_TARGET: executable } }).trim();
+    if (running) throw new Error("Inspector is running from the package output. Close it or set COCOS_INSPECTOR_PACKAGE_OUTPUT to another workspace directory before packaging.");
+}
 const temporary = path.join(root, ".tmp"); fs.mkdirSync(temporary, { recursive: true });
 const stage = fs.mkdtempSync(path.join(temporary, "inspector-package-"));
 fs.cpSync(path.join(root, "dist-desktop"), stage, { recursive: true, filter: source => !source.endsWith(".log") });
@@ -19,8 +30,6 @@ function copyDependency(name) {
     for (const dependency of Object.keys(info.dependencies || {})) copyDependency(dependency);
 }
 for (const dependency of Object.keys(project.dependencies || {})) copyDependency(dependency);
-const output = path.resolve(root, "releases");
-if (!output.startsWith(root + path.sep)) throw new Error("Package output must remain inside this workspace");
 const electronVersion = JSON.parse(fs.readFileSync(path.join(root, "node_modules/electron/package.json"), "utf8")).version;
 // Reuse the downloaded runtime even when it came from a mirror. Verify against
 // Electron's pinned checksums before handing a local archive to the packager.

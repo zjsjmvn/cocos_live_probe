@@ -1,5 +1,7 @@
 node_modules/
 .tmp/
 dist-desktop/
+/runtime-inspector-desktop.js
 releases/
+releases-*/
 .runtime-probe-evidence/

@@ -1,8 +1,12 @@
+import { inspectorValueTools } from "./runtime-inspector-values";
+
 export type InspectorRequest =
     | { action: "tree" }
     | { action: "inspect"; uuid: string; context: string }
-    | { action: "edit"; uuid: string; context: string; field: string; value: unknown; componentUuid?: string }
+    | { action: "edit"; uuid: string; context: string; field: string; value: unknown; componentUuid?: string; propertyPath?: string[] }
     | { action: "move"; uuid: string; context: string; parentUuid: string; siblingIndex: number; keepWorldTransform: boolean }
+    | { action: "remove"; uuid: string; context: string }
+    | { action: "expose"; uuid: string; context: string; componentUuid?: string }
     | { action: "pause"; context: string }
     | { action: "resume"; context: string };
 
@@ -11,28 +15,32 @@ export function parseInspectorRequest(value: unknown): InspectorRequest {
     const request = value as Record<string, unknown>;
     const allowed: Record<string, string[]> = {
         tree: ["action"], inspect: ["action", "uuid", "context"],
-        edit: ["action", "uuid", "context", "field", "value", "componentUuid"],
+        edit: ["action", "uuid", "context", "field", "value", "componentUuid", "propertyPath"],
         move: ["action", "uuid", "context", "parentUuid", "siblingIndex", "keepWorldTransform"],
+        remove: ["action", "uuid", "context"], expose: ["action", "uuid", "context", "componentUuid"],
         pause: ["action", "context"], resume: ["action", "context"],
     };
     const keys = Object.prototype.hasOwnProperty.call(allowed, String(request.action)) ? allowed[String(request.action)] : undefined;
     if (!keys || Object.keys(request).some(key => !keys.includes(key))) throw new Error("Unknown inspector action or argument");
-    for (const key of keys.filter(key => !["action", "value", "componentUuid", "siblingIndex", "keepWorldTransform"].includes(key))) {
+    for (const key of keys.filter(key => !["action", "value", "componentUuid", "propertyPath", "siblingIndex", "keepWorldTransform"].includes(key))) {
         if (typeof request[key] !== "string" || !(request[key] as string).length || (request[key] as string).length > 4096) {
             throw new Error(`Invalid ${key}`);
         }
     }
-    if (request.action === "edit") {
-        if (!("value" in request)) throw new Error("Missing edit value");
+    if (request.action === "edit" || request.action === "expose") {
+        if (request.action === "edit" && !("value" in request)) throw new Error("Missing edit value");
         if (request.componentUuid !== undefined && (typeof request.componentUuid !== "string" || !request.componentUuid.length)) throw new Error("Invalid componentUuid");
     }
+    if (request.propertyPath !== undefined && (request.action !== "edit" || !request.componentUuid || !Array.isArray(request.propertyPath)
+        || request.propertyPath.length > 3 || request.propertyPath.some(segment => typeof segment !== "string" || !/^(?:[a-zA-Z][\w]*|\d+)$/.test(segment)
+            || ["constructor", "prototype", "__proto__"].includes(segment)))) throw new Error("Invalid component property path");
     if (request.action === "move" && (!Number.isInteger(request.siblingIndex) || Number(request.siblingIndex) < 0
         || typeof request.keepWorldTransform !== "boolean")) throw new Error("Invalid hierarchy arguments");
     return request as InspectorRequest;
 }
 
 // Kept as a function so browser evaluation and engine fixtures execute the same implementation.
-async function inspectRuntime(request: InspectorRequest): Promise<unknown> {
+async function inspectRuntime(request: InspectorRequest, valuesFactory: typeof inspectorValueTools): Promise<unknown> {
     const runtime = globalThis as any;
     let cc = runtime.cc;
     if (runtime.System?.import) cc = await runtime.System.import("cc");
@@ -62,33 +70,7 @@ async function inspectRuntime(request: InspectorRequest): Promise<unknown> {
         if (!node) throw new Error("节点已移除，请刷新节点树");
         return node;
     };
-    const primitive = (value: any) => typeof value === "boolean" || typeof value === "string"
-        || (typeof value === "number" && Number.isFinite(value));
-    const descriptor = (object: any, field: string): PropertyDescriptor | undefined => {
-        for (let current = object; current; current = Object.getPrototypeOf(current)) {
-            const found = Object.getOwnPropertyDescriptor(current, field);
-            if (found) return found;
-        }
-        return undefined;
-    };
-    const writable = (object: any, field: string): boolean => {
-        const info = descriptor(object, field);
-        return Boolean(info && (info.set || info.writable));
-    };
-    const componentFields = (component: any): any[] => {
-        const names: string[] = Array.from(new Set<string>(["enabled", ...(component.constructor.__props__ || [])]));
-        return names.filter(name => /^[a-zA-Z][\w]*$/.test(name) && !["node", "uuid", "name", "constructor", "prototype"].includes(name))
-            .slice(0, 100).map(name => {
-                try {
-                    const value = component[name];
-                    const scalar = primitive(value);
-                    const summary = scalar || value == null ? value ?? null : Array.isArray(value)
-                        ? `[Array(${value.length})]` : value.uuid ? `${value.name || value.constructor?.name || "Object"} (${value.uuid})`
-                            : `[${value.constructor?.name || "Object"}]`;
-                    return { name, value: summary, editable: scalar && writable(component, name), type: scalar ? typeof value : "reference" };
-                } catch { return { name, value: "[读取失败]", editable: false, type: "reference" }; }
-            });
-    };
+    const values = valuesFactory(cc, nodes);
     if (request.action === "pause" || request.action === "resume") {
         cc.director[request.action]();
         return { context, paused: cc.director.isPaused() };
@@ -96,9 +78,25 @@ async function inspectRuntime(request: InspectorRequest): Promise<unknown> {
     if (request.action === "tree") return {
         context, scene: scene.name, paused: cc.director.isPaused(),
         nodes: nodes.map(node => ({ uuid: node.uuid, name: node.name, parentUuid: node === scene ? null : node.parent?.uuid,
-            active: node.active, activeInHierarchy: node.activeInHierarchy, childCount: node.children.length })),
+            active: node.active, activeInHierarchy: node.activeInHierarchy, childCount: node.children.length,
+            prefab: node._prefab?.root === node ? node._prefab?.asset?.uuid || true : false,
+            fairyName: typeof node.$gobj?.name === "string" ? node.$gobj.name.slice(0, 256) : null,
+            componentTypes: node.components.map((component: any) => cc.js?.getClassName(component) || component.constructor.name) })),
     };
     const node = resolve(request.uuid);
+    if (request.action === "remove") {
+        if (node === scene) throw new Error("不能移除场景根节点");
+        node.destroy();
+        return { context, uuid: node.uuid, removed: true };
+    }
+    if (request.action === "expose") {
+        const value = request.componentUuid ? node.components.find((item: any) => item.uuid === request.componentUuid && cc.isValid(item, true)) : node;
+        if (!value) throw new Error("组件已移除，请重新选择节点");
+        const name = request.componentUuid ? "$probeComponent" : "$probeNode";
+        Object.defineProperty(runtime, name, { value, writable: true, configurable: true });
+        runtime.console?.log(name, value);
+        return { context, name, uuid: value.uuid };
+    }
     if (request.action === "move") {
         if (node === scene) throw new Error("不能移动场景根节点");
         const parent = resolve(request.parentUuid);
@@ -124,9 +122,7 @@ async function inspectRuntime(request: InspectorRequest): Promise<unknown> {
         if (request.componentUuid) {
             const component = node.components.find((item: any) => item.uuid === request.componentUuid && cc.isValid(item, true));
             if (!component) throw new Error("组件已移除，请重新选择节点");
-            const property = componentFields(component).find(item => item.name === field && item.editable);
-            if (!property || typeof value !== property.type || !primitive(value)) throw new Error("组件字段只接受同类型的可写公开基础属性");
-            component[field] = value;
+            values.edit(component, field, request.propertyPath || [], value);
         } else if (field === "name" && typeof value === "string" && value.length <= 1024) node.name = value;
         else if (field === "active" && typeof value === "boolean") node.active = value;
         else if (["position", "eulerAngles", "scale"].includes(field)) {
@@ -152,13 +148,14 @@ async function inspectRuntime(request: InspectorRequest): Promise<unknown> {
         siblingIndex: node.getSiblingIndex(), position: vector(node.position, ["x", "y", "z"]),
         eulerAngles: vector(node.eulerAngles, ["x", "y", "z"]), scale: vector(node.scale, ["x", "y", "z"]),
         worldPosition: vector(node.worldPosition, ["x", "y", "z"]),
+        layer: node.layer ?? null, opacity: node._uiProps?.opacity ?? null,
         uiTransform: transform ? { contentSize: vector(transform.contentSize, ["width", "height"]), anchorPoint: vector(transform.anchorPoint, ["x", "y"]) } : null,
         components: node.components.filter((item: any) => cc.isValid(item, true)).map((component: any) => ({
-            uuid: component.uuid, type: cc.js?.getClassName(component) || component.constructor.name, fields: componentFields(component),
+            uuid: component.uuid, type: cc.js?.getClassName(component) || component.constructor.name, fields: values.fields(component),
         })),
     };
 }
 
 export function buildInspectorExpression(request: InspectorRequest): string {
-    return `(${inspectRuntime.toString()})(${JSON.stringify(parseInspectorRequest(request))})`;
+    return `(${inspectRuntime.toString()})(${JSON.stringify(parseInspectorRequest(request))}, ${inspectorValueTools.toString()})`;
 }

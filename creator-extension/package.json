@@ -1,0 +1,24 @@
+{
+  "name": "cocos-live-probe",
+  "title": "Cocos Live Probe",
+  "version": "0.1.0",
+  "package_version": 2,
+  "description": "从 Cocos Creator 快捷启动实时游戏与节点检查器。",
+  "editor": ">=3.8.0",
+  "main": "./main.cjs",
+  "contributions": {
+    "menu": [
+      {
+        "path": "i18n:menu.extension/Cocos Live Probe",
+        "label": "启动检查器",
+        "message": "open-inspector"
+      }
+    ],
+    "shortcuts": [
+      { "message": "open-inspector", "win": "shift+enter", "mac": "shift+enter" }
+    ],
+    "messages": {
+      "open-inspector": { "methods": ["openInspector"] }
+    }
+  }
+}

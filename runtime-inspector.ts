@@ -3,12 +3,19 @@ import * as fs from "fs";
 import * as path from "path";
 import { randomBytes } from "crypto";
 import { buildInspectorExpression, parseInspectorRequest } from "./runtime-inspector-core";
+import { buildWorkbenchExpression, parseWorkbenchRequest } from "./runtime-inspector-workbench";
+import { parseInteractionCommand } from "./runtime-interaction";
 import { RuntimeProbeService, RuntimeProbeServiceHandle, runtimeProbeOptionsFromEnv, parseRuntimeProbeArgs } from "./runtime-probe";
 
-export function createRuntimeInspectorServer(service: RuntimeProbeServiceHandle): http.Server {
+type InspectorTheme = "graphite" | "midnight" | "light";
+type InspectorDensity = "comfortable" | "compact";
+export function createRuntimeInspectorServer(service: RuntimeProbeServiceHandle, desktopTheme: InspectorTheme | (() => InspectorTheme) = "graphite",
+    desktopDensity: InspectorDensity | (() => InspectorDensity) = "comfortable"): http.Server {
     const token = randomBytes(32).toString("hex");
     const page = fs.readFileSync(path.join(__dirname, "inspector/index.html"), "utf8").replace("__INSPECTOR_TOKEN__", token);
-    const desktopPage = page.replace("<body>", '<body class="desktop-mode">');
+    const desktopPage = () => page.replace("<body>", '<body class="desktop-mode">')
+        .replace('data-theme="graphite"', `data-theme="${typeof desktopTheme === "function" ? desktopTheme() : desktopTheme}"`)
+        .replace('data-density="comfortable"', `data-density="${typeof desktopDensity === "function" ? desktopDensity() : desktopDensity}"`);
     return http.createServer(async (request, response) => {
         response.setHeader("Cache-Control", "no-store");
         response.setHeader("X-Content-Type-Options", "nosniff");
@@ -26,8 +33,9 @@ export function createRuntimeInspectorServer(service: RuntimeProbeServiceHandle)
         if (request.method === "GET") {
             const assets: Record<string, [string, string]> = {
                 "/": ["text/html; charset=utf-8", page],
-                "/desktop": ["text/html; charset=utf-8", desktopPage],
+                "/desktop": ["text/html; charset=utf-8", desktopPage()],
                 "/inspector.js": ["text/javascript; charset=utf-8", fs.readFileSync(path.join(__dirname, "inspector/inspector.js"), "utf8")],
+                "/workbench.js": ["text/javascript; charset=utf-8", fs.readFileSync(path.join(__dirname, "inspector/workbench.js"), "utf8")],
                 "/inspector.css": ["text/css; charset=utf-8", fs.readFileSync(path.join(__dirname, "inspector/inspector.css"), "utf8")],
             };
             const asset = Object.prototype.hasOwnProperty.call(assets, request.url ?? "") ? assets[request.url!] : undefined;
@@ -50,6 +58,12 @@ export function createRuntimeInspectorServer(service: RuntimeProbeServiceHandle)
             let result: unknown;
             if (payload.action === "status" && Object.keys(payload).length === 1) {
                 result = await service.dispatch({ kind: "status" });
+            } else if (payload.action === "diagnostics" && Object.keys(payload).every(key => ["action", "options"].includes(key))) {
+                result = await service.dispatch(parseInteractionCommand("diagnostics", payload.options || {}));
+            } else if (["runtime-info", "runtime-assets", "runtime-setting", "storage"].includes(payload.action)) {
+                result = await service.dispatch({ kind: "eval", expression: buildWorkbenchExpression(parseWorkbenchRequest(payload)) });
+            } else if (payload.action === "game-state" && Object.keys(payload).length === 1) {
+                result = await service.dispatch({ kind: "game-state", args: {} });
             } else if (payload.action === "evidence" && Object.keys(payload).every(key => ["action", "request"].includes(key))) {
                 result = await service.dispatch(parseRuntimeProbeArgs(["evidence", JSON.stringify(payload.request)]));
             } else if (payload.action === "screenshot" && Object.keys(payload).length === 1) {

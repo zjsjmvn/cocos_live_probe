@@ -4,6 +4,9 @@
   "private": true,
   "description": "Local CLI and MCP diagnostics for a running Cocos Creator browser preview.",
   "scripts": {
+    "install:creator-extension": "node scripts/install-creator-extension.cjs",
+    "test:creator-extension": "node --test test/creator-extension.test.cjs",
+    "test:creator-extension:electron": "electron test/creator-extension-electron.cjs",
     "runtime:probe:inspector": "npm run build:inspector && electron dist-desktop/runtime-inspector-desktop.js",
     "runtime:probe:inspector:web": "ts-node -P tsconfig.json runtime-inspector.ts",
     "build:inspector": "node scripts/build-inspector-desktop.cjs",

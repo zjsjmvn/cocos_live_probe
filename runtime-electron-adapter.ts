@@ -1,6 +1,7 @@
 import { WebContents, WebContentsView } from "electron";
 import { randomUUID } from "crypto";
 import { createConnection } from "net";
+import * as path from "path";
 import { CdpTarget, CdpTargetInfo, decodeRuntimeEvaluateResponse } from "./cdp-runtime-probe-core";
 import { RuntimeProbeBrowserClient, RuntimeProbeDependencies, RuntimeProbeEvaluator } from "./runtime-probe";
 
@@ -33,7 +34,7 @@ export function createElectronProbeDependencies(
             if (!entry || entry.view) throw new Error("Desktop preview requires a new owned context");
             const view = new WebContentsView({ webPreferences: {
                 partition: `cocos-live-probe-${contextId}`, nodeIntegration: false, contextIsolation: true,
-                sandbox: true, backgroundThrottling: false,
+                sandbox: true, backgroundThrottling: false, preload: path.join(__dirname, "inspector/game-tools-preload.cjs"),
             } });
             entry.view = view; entry.id = String(view.webContents.id);
             view.webContents.setWindowOpenHandler(() => ({ action: "deny" }));

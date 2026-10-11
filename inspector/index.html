@@ -1,17 +1,76 @@
 <!doctype html>
-<html lang="zh-CN">
-<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="inspector-token" content="__INSPECTOR_TOKEN__"><title>Cocos Live Probe · Inspector</title><link rel="stylesheet" href="/inspector.css"><script src="/inspector.js" defer></script></head>
+<html lang="zh-CN" data-theme="graphite" data-density="comfortable">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="inspector-token" content="__INSPECTOR_TOKEN__">
+  <title>Cocos Live Probe · Inspector</title>
+  <link rel="stylesheet" href="/inspector.css">
+  <script src="/inspector.js" defer></script>
+  <script src="/workbench.js" defer></script>
+</head>
 <body>
-<header><div><strong>Cocos Live Probe</strong><span class="badge">Inspector</span><span id="ai-activity" hidden></span></div><div class="toolbar"><button id="ai-connect" hidden title="复制当前窗口和选中节点的 AI 接入说明">AI 接入</button><button id="reload-preview" hidden>重载游戏</button><button id="refresh">刷新节点树</button><label><input id="auto" type="checkbox"> 自动同步</label><button id="pause" disabled>暂停游戏</button><button id="capture">更新画面</button><button id="devtools" hidden>开发者工具</button></div></header>
-<div id="connection">正在连接人工调试实例…</div>
-<div id="evidence-bar" class="toolbar"><button id="evidence-start">开始取证</button><button id="evidence-save">保存验收包</button><span id="evidence-state" role="status">尚未开始取证</span></div>
-<main>
-<nav id="inspector-tabs" hidden role="tablist" aria-label="调试面板"><button id="nodes-tab" role="tab" aria-selected="true" aria-controls="tree">节点树 / 属性</button><button id="devtools-tab" role="tab" aria-selected="false" aria-controls="devtools-host">开发者工具</button><button id="close-devtools" hidden title="关闭开发者工具" aria-label="关闭开发者工具">×</button></nav>
-<section id="devtools-host" hidden aria-label="游戏开发者工具"></section>
-<section class="hierarchy"><div class="section-title">节点树 <span id="count"></span></div><input id="search" type="search" placeholder="搜索节点名称、路径或 UUID" aria-label="搜索节点"><label class="filter"><input id="inactive" type="checkbox" checked> 显示未激活节点</label><div id="tree" role="tree" aria-label="场景节点树"></div></section>
-<section class="preview"><div class="section-title">运行画面 <span id="scene"></span></div><div class="canvas"><img id="shot" alt="运行中预览的最新截图" hidden><p id="shot-hint">点击「更新画面」查看当前预览。<br>游戏操作在探针的 Chrome 预览窗口中进行。</p></div><p class="hint">调整即时生效，仅保存在运行内存中；重新加载预览后恢复。<br>动态脚本、动画与 Layout 可能在下一帧覆盖手工设置。</p></section>
-<section class="properties"><div class="section-title">属性检查器 <button id="deselect">返回节点树</button></div><div id="details"><p class="empty">选择节点以查看和调整属性</p></div></section>
-</main>
-<div id="splitter" hidden role="separator" aria-label="调整预览和节点面板宽度" aria-orientation="vertical" tabindex="0"></div>
-<footer id="message" role="status" aria-live="polite">等待节点树</footer>
-</body></html>
+  <header>
+    <div class="brand"><span class="brand-mark" aria-hidden="true">◈</span><div><strong>Cocos Live Probe</strong><span class="badge">INSPECTOR</span></div><span id="ai-activity" hidden></span></div>
+    <div class="toolbar">
+      <div class="toolbar-group"><button id="reload-preview" hidden title="重新加载当前游戏，运行时修改将恢复">重载游戏</button><button id="refresh" title="读取最新节点树，不重载游戏">刷新节点树</button><label class="switch"><input id="auto" type="checkbox"> 自动同步</label></div>
+      <div class="toolbar-group"><button id="pause" disabled>暂停游戏</button><button id="capture">更新画面</button><button id="devtools" hidden>开发者工具</button></div>
+      <button id="ai-connect" class="primary" hidden title="复制当前窗口和选中节点的 AI 接入说明">AI 接入 <span aria-hidden="true">↗</span></button>
+    </div>
+  </header>
+  <div id="connection">正在连接人工调试实例…</div>
+  <div id="evidence-bar">
+    <span class="evidence-label"><span class="status-dot" aria-hidden="true"></span>调试记录</span>
+    <span id="evidence-state" role="status">尚未开始取证</span>
+    <div class="toolbar"><button id="evidence-start" title="记录当前窗口后续的调试操作">开始取证</button><button id="evidence-save" title="保存画面、操作记录与验收结果">保存验收包</button></div>
+  </div>
+  <main>
+    <nav id="inspector-tabs" hidden role="tablist" aria-label="调试面板"><button id="nodes-tab" role="tab" aria-selected="true" aria-controls="node-panels">节点树 / 属性</button><button id="devtools-tab" role="tab" aria-selected="false" aria-controls="devtools-host" tabindex="-1">开发者工具</button><button id="info-tab" role="tab" aria-selected="false" aria-controls="workbench-host" tabindex="-1">Cocos</button><button id="logs-tab" role="tab" aria-selected="false" aria-controls="workbench-host" tabindex="-1">日志</button><button id="extensions-tab" role="tab" aria-selected="false" aria-controls="workbench-host" tabindex="-1">扩展</button><button id="close-devtools" hidden title="关闭开发者工具" aria-label="关闭开发者工具">×</button></nav>
+    <section id="devtools-host" hidden role="tabpanel" aria-labelledby="devtools-tab"></section>
+    <section id="workbench-host" hidden role="tabpanel" aria-labelledby="info-tab">
+      <div class="workbench-toolbar"><select id="workbench-section" aria-label="Cocos 信息分类"><option value="info">引擎 / 渲染</option><option value="assets">已加载资源</option><option value="storage">本地存储</option></select><button id="workbench-refresh">刷新</button><button id="workbench-copy">复制结果</button></div>
+      <div id="workbench-content"><p class="empty">点击刷新读取当前游戏</p></div>
+    </section>
+    <div id="node-panels">
+      <section class="hierarchy" aria-label="节点树">
+        <div class="section-title"><span>节点树 <span id="count" class="count"></span></span><span class="eyebrow">HIERARCHY</span></div>
+        <div class="tree-tools">
+          <div class="search-box"><span aria-hidden="true">⌕</span><input id="search" type="search" placeholder="名称、路径或 UUID" aria-label="搜索节点" aria-keyshortcuts="Control+K Meta+K"><button id="clear-search" hidden aria-label="清除搜索" title="清除搜索 · Esc">×</button><kbd id="search-shortcut" title="搜索快捷键">Ctrl K</kbd></div>
+          <div class="tree-actions"><label class="filter"><input id="inactive" type="checkbox" checked> 包含未激活</label><label class="filter">搜索 <select id="search-mode" aria-label="节点搜索范围"><option value="node">节点</option><option value="component">组件</option></select></label><label class="filter"><input id="search-exact" type="checkbox"> 完全匹配</label><label class="filter"><input id="search-subtree" type="checkbox"> 当前子树</label><label class="filter"><input id="hide-builtin" type="checkbox"> 隐藏内建组件</label><label class="filter"><input id="fairy-tree" type="checkbox"> FairyGUI 名称</label><div><button id="expand-all" title="展开所有节点">展开</button><button id="collapse-all" title="折叠所有节点">折叠</button><button id="reveal-selection" disabled title="清除搜索并定位当前选中节点">定位</button></div></div>
+        </div>
+        <div id="tree" role="tree" aria-label="场景节点树"><p class="empty">正在读取场景节点…</p></div>
+        <div class="tree-help">↑ ↓ 导航 <span>← → 展开 / 折叠</span> Enter 选择</div>
+      </section>
+      <div id="property-splitter" hidden role="separator" aria-label="调整节点树和属性区宽度" aria-orientation="vertical" tabindex="0"></div>
+      <section class="properties" aria-label="属性检查器">
+        <div class="section-title"><span id="property-heading">属性检查器</span><button id="deselect" title="取消选择">取消选择</button></div>
+        <div id="property-tabs" hidden role="tablist" aria-label="节点属性"><button id="basic-tab" role="tab" aria-selected="true" aria-controls="basic-panel">基础属性</button><button id="components-tab" role="tab" aria-selected="false" aria-controls="components-panel" tabindex="-1">组件 <span id="component-count" class="count"></span></button></div>
+        <div id="component-tools" hidden>
+          <div class="search-box"><span aria-hidden="true">⌕</span><input id="component-search" type="search" placeholder="搜索组件或字段" aria-label="搜索组件或字段"><button id="clear-component-search" hidden aria-label="清除组件搜索">×</button></div>
+          <div class="tree-actions"><label class="filter"><input id="editable-only" type="checkbox"> 仅可编辑字段</label><label class="filter"><input id="sort-fields" type="checkbox"> 字段排序</label><div><button id="expand-components">展开</button><button id="collapse-components">折叠</button></div></div>
+        </div>
+        <div id="draft-bar" hidden><span id="draft-state"></span><button id="discard-draft">放弃修改</button></div>
+        <div id="details"><div class="empty selection-empty"><span class="empty-icon" aria-hidden="true">◇</span><strong>从节点开始调试</strong><p>选择一个场景节点，查看 Transform 和组件属性。</p><span>修改仅在当前运行实例中生效</span></div></div>
+      </section>
+    </div>
+    <section class="preview" aria-label="运行画面">
+      <div id="preview-tools" hidden aria-label="游戏工具栏"><div class="preview-tools-left"></div><div class="preview-tools-right"></div></div>
+      <div id="resolution-panel" hidden aria-label="预览分辨率">
+        <label>分辨率 <select id="resolution-preset" aria-label="预览分辨率预设"><option value="auto">适应窗口</option><option value="390x844">手机 · 390 × 844</option><option value="720x1280">竖屏 · 720 × 1280</option><option value="1280x720">横屏 · 1280 × 720</option><option value="1920x1080">桌面 · 1920 × 1080</option><option value="custom">自定义</option></select></label>
+        <div class="resolution-dimensions"><label>宽 <input id="resolution-width" type="number" min="160" max="4096" step="1" value="390" aria-label="预览宽度"></label><span>×</span><label>高 <input id="resolution-height" type="number" min="160" max="4096" step="1" value="844" aria-label="预览高度"></label><button id="resolution-rotate" title="切换横屏 / 竖屏" aria-label="切换横屏 / 竖屏">旋转</button><button id="resolution-apply">应用</button><button id="resolution-close" title="收起分辨率面板" aria-label="收起分辨率面板">×</button></div>
+        <span id="resolution-state" role="status">适应窗口 · 切换分辨率保留当前游戏</span>
+      </div>
+      <div class="section-title"><span id="preview-heading">运行画面</span><span id="scene"></span><span id="engine-state" class="engine-state">连接中</span></div>
+      <div id="capture-state" hidden role="status"></div>
+      <div class="canvas"><img id="shot" alt="运行中预览的最新截图" hidden><p id="shot-hint">点击「更新画面」查看当前预览。<br>游戏操作在探针的 Chrome 预览窗口中进行。</p></div>
+      <p class="hint"><span class="status-dot" aria-hidden="true"></span> 运行时修改 · 重载后恢复<br>动态脚本、动画与 Layout 可能覆盖修改，可先暂停游戏。</p>
+    </section>
+  </main>
+  <div id="splitter" hidden role="separator" aria-label="调整预览和节点面板宽度" aria-orientation="vertical" aria-valuemin="30" aria-valuemax="70" aria-valuenow="46" tabindex="0"></div>
+  <footer><span id="message" role="status" aria-live="polite" tabindex="-1">等待节点树</span><button id="message-details" hidden aria-controls="message-popover" aria-expanded="false" title="查看完整状态信息">详情</button><span id="sync-state">连接中…</span><label class="appearance-control">外观 <select id="theme" aria-label="界面配色"><option value="graphite">石墨</option><option value="midnight">午夜</option><option value="light">浅色</option></select></label><label class="appearance-control">密度 <select id="density" aria-label="界面密度"><option value="comfortable">舒适</option><option value="compact">紧凑</option></select></label></footer>
+  <div id="message-popover" hidden role="dialog" aria-labelledby="message-heading"><div class="message-popover-heading"><strong id="message-heading">状态详情</strong><span><button id="copy-message" title="复制完整状态信息">复制全文</button><button id="close-message" aria-label="关闭状态详情" title="关闭状态详情 · Esc">×</button></span></div><p id="message-copy-error" hidden role="status"></p><p id="message-full" tabindex="0"></p></div>
+  <aside id="inspector-menu" hidden role="dialog" aria-labelledby="menu-heading"><div class="menu-heading"><strong id="menu-heading">设置</strong><button id="close-menu" aria-label="关闭菜单">×</button></div><div id="menu-settings" hidden><p class="menu-help">运行时修改仅在当前游戏中生效，重载后恢复。</p></div><div id="menu-evidence" hidden></div><div id="menu-help" hidden><p>选择节点后，右侧连续显示节点属性和组件。</p><p>Ctrl K 搜索节点 · Esc 清除搜索<br>↑ ↓ 导航 · ← → 展开 / 折叠<br>Enter 选择节点或应用属性</p><p>拖动分隔线调整宽度，双击恢复默认。</p></div></aside>
+  <div id="node-menu" hidden role="menu" aria-label="节点操作"></div>
+  <div id="runtime-confirm" hidden role="dialog" aria-modal="false" aria-labelledby="runtime-confirm-title"><strong id="runtime-confirm-title"></strong><p id="runtime-confirm-text"></p><div><button id="runtime-confirm-cancel">取消</button><button id="runtime-confirm-apply">确认</button></div></div>
+</body>
+</html>
